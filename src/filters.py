@@ -1,5 +1,5 @@
 from typing import Callable
-from src.constants import FileType, HKQuantityType
+from constants import FileType, HKQuantityType
 
 import pandas as pd
 import numpy as np  # ensure numpy is imported

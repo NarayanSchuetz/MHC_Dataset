@@ -6,7 +6,7 @@ from typing import List, Dict
 
 from constants import HKQuantityType, FileType, MotionActivityType, HKWorkoutType
 from utils import split_intervals_at_midnight, split_sleep_intervals_at_midnight
-from src.filters import FilterFactory
+from filters import FilterFactory
 from metadata import calculate_data_coverage, compute_array_statistics
 
 
