@@ -432,9 +432,64 @@ class TestCreateDatasetSynthetic:
         dummy_metadata.to_parquet(output_dir / "metadata.parquet")
 
         # Recompute with force_recompute=True
-        create_dataset(synthetic_dfs, str(output_dir), force_recompute=True)
+        create_dataset(synthetic_dfs, str(output_dir), force_recompute=True, force_recompute_metadata=True)
         recomputed_metadata = pd.read_parquet(output_dir / "metadata.parquet")
 
         pd.testing.assert_frame_equal(initial_metadata, recomputed_metadata), \
             "Metadata not properly recomputed when force_recompute=True"
+
+    def test_metadata_mixed_existing_and_new(self, synthetic_dfs, tmp_path, expected_output_shape):
+        """Test that metadata is correctly calculated when there's a mix of existing and new .npy files."""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        # Create two dates for testing
+        date1 = pd.Timestamp("2022-01-01")
+        date2 = pd.Timestamp("2022-01-02")
+        
+        # Create synthetic dataframes for both dates
+        synthetic_dfs_date1 = synthetic_dfs.copy()
+        synthetic_dfs_date2 = create_synthetic_dfs()  # Assuming this creates data for 2022-01-01
+
+        # Adjust the synthetic dataframes to represent different dates
+        for file_type, df in synthetic_dfs_date1.items():
+            synthetic_dfs_date1[file_type]["startTime"] = df["startTime"].apply(lambda x: date1)
+            synthetic_dfs_date1[file_type]["endTime"] = df["endTime"].apply(lambda x: date1 + timedelta(hours=1))
+        for file_type, df in synthetic_dfs_date2.items():
+            synthetic_dfs_date2[file_type]["startTime"] = df["startTime"].apply(lambda x: date2)
+            synthetic_dfs_date2[file_type]["endTime"] = df["endTime"].apply(lambda x: date2 + timedelta(hours=1))
+
+        # Create an existing .npy file for date1
+        filename1 = date1.strftime("%Y-%m-%d") + ".npy"
+        output_filepath1 = output_dir / filename1
+        expected_data = np.full(expected_output_shape, 1.0, dtype=np.float32)
+        np.save(output_filepath1, expected_data)
+
+        # Call create_dataset with data for both dates
+        all_dfs = {k: pd.concat([synthetic_dfs_date1[k], synthetic_dfs_date2[k]]) for k in synthetic_dfs_date1.keys()}
+        create_dataset(all_dfs, str(output_dir), force_recompute=False, force_recompute_metadata=True)
+
+        # Check that metadata file exists
+        metadata_path = output_dir / "metadata.parquet"
+        assert metadata_path.exists(), "Metadata file was not created"
+
+        # Load and verify metadata
+        metadata_df = pd.read_parquet(metadata_path)
+
+        # Check that both dates are present in the metadata
+        assert date1.date() in metadata_df["date"].values, f"Date {date1.date()} not found in metadata"
+        assert date2.date() in metadata_df["date"].values, f"Date {date2.date()} not found in metadata"
+
+        # Check that the data coverage for date1 is 100% (since we pre-populated the .npy file with ones)
+        metadata_date1 = metadata_df[metadata_df["date"] == date1.date()]
+        assert np.allclose(metadata_date1["data_coverage"], 100.0), "Incorrect data coverage for date1"
+
+        # Check that the data coverage for date2 is as expected for synthetic data
+        metadata_date2 = metadata_df[metadata_df["date"] == date2.date()]
+        
+        # For synthetic HealthKit data (steps from 00:00 to 01:00)
+        # First row should correspond to first channel (HealthKit steps)
+        steps_row = metadata_date2.iloc[0]
+        assert np.isclose(steps_row["data_coverage"], 60/1440 * 100), \
+            "Incorrect data coverage for steps on date2"
 

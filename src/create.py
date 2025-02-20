@@ -114,6 +114,7 @@ def create_dataset(
     output_root_dir: str,
     skip: List[FileType] = [],
     force_recompute: bool = False,
+    force_recompute_metadata: bool = False,
 ):
     """
     Create a minute-level dataset from multiple data sources.
@@ -144,7 +145,8 @@ def create_dataset(
 
     # Check if metadata file exists and we're not forcing recompute
     metadata_filepath = os.path.join(output_root_dir, "metadata.parquet")
-    if os.path.exists(metadata_filepath) and not force_recompute:
+    if os.path.exists(metadata_filepath) and not force_recompute_metadata:
+        print(f"Skipping metadata recomputation for {output_root_dir} because it already exists.")
         return
     
     # Create output directory if it doesn't exist
@@ -195,52 +197,25 @@ def create_dataset(
     for date, df_hk in dfs_dict_daily[FileType.HEALTHKIT].items():
         original_time_offset = df_hk.iloc[0]['startTime_timezone_offset']
         output_filepath = os.path.join(output_root_dir, date.strftime("%Y-%m-%d") + ".npy")
+        
+        # Load existing file or generate new data
         if os.path.exists(output_filepath) and not force_recompute:
             print(f"Skipping {date} for output directory {output_root_dir} because it already exists.")
-            continue
+            daily_minute_level_matrix = np.load(output_filepath)
+        else:
+            if df_hk.empty:
+                return  # Skip user if no HealthKit data
+            daily_minute_level_matrix = _generate_daily_data(dfs_dict_daily, date, skip)
+            np.save(output_filepath, daily_minute_level_matrix)
 
-        if df_hk.empty:
-            # we don't want to generate data where even the HealthKit data is missing (by far the most common data type)
-            return
-
-        daily_minute_level_matrix = []
-
-        # generate the minute-level data for all other file types
-        for file_type in FileType:
-            if file_type in skip:
-                continue
-            
-            df = dfs_dict_daily[file_type].get(date, pd.DataFrame())
-            # generate the minute-level data (each is a 2D array)
-            minute_data = _generate_minute_level_data_factory(file_type)(df, date)
-            daily_minute_level_matrix.append(minute_data)
-
-        # Vertically stack the 2D arrays into a single 2D array.
-        daily_minute_level_matrix = np.vstack(daily_minute_level_matrix)
-
-        # Calculate     
-        data_coverage = calculate_data_coverage(daily_minute_level_matrix)
-
-        # Calculate a mask of same dimension as daily_minute_level_matrix where each values is 1 if the corresponding value in daily_minute_level_matrix is not 0 or nan.
-        data_mask = np.ones_like(daily_minute_level_matrix)
-        data_mask[daily_minute_level_matrix == 0] = 0
-        data_mask[np.isnan(daily_minute_level_matrix)] = 0
-
-        # Reshape both arrays to have matching dimensions (2, C, 1440)
-        data_mask = data_mask[np.newaxis, ...]  # Shape: (1, C, 1440)
-        daily_minute_level_matrix = daily_minute_level_matrix[np.newaxis, ...]  # Shape: (1, C, 1440)
-        
-        # Concatenate along first dimension to get shape (2, C, 1440)
-        daily_minute_level_matrix = np.concatenate([data_mask, daily_minute_level_matrix], axis=0)
-
+        # Calculate metadata for both new and existing files
+        data_coverage = calculate_data_coverage(daily_minute_level_matrix[1])
         stats_df = compute_array_statistics(daily_minute_level_matrix)
         metadata_df = pd.concat([data_coverage, stats_df], axis=1)
         metadata_df.columns = ["data_coverage", "n", "sum", "sum_of_squares"]
         metadata_df["date"] = date
         metadata_df["original_time_offset"] = original_time_offset
         metadata_collection.append(metadata_df)
-
-        np.save(output_filepath, daily_minute_level_matrix)
     
     # Only update metadata if we processed any files
     if metadata_collection:
@@ -598,3 +573,26 @@ def create_synthetic_dfs() -> Dict[FileType, pd.DataFrame]:
         FileType.SLEEP: sleep_df,
         FileType.WORKOUT: workout_df,
     }
+
+
+def _generate_daily_data(dfs_dict_daily, date, skip):
+    """Generate and process daily data matrix with mask concatenation"""
+    matrix_components = []
+    
+    for file_type in FileType:
+        if file_type in skip:
+            continue
+        df = dfs_dict_daily[file_type].get(date, pd.DataFrame())
+        minute_data = _generate_minute_level_data_factory(file_type)(df, date)
+        matrix_components.append(minute_data)
+    
+    stacked_matrix = np.vstack(matrix_components)
+    
+    # Create data mask and combine with actual data
+    data_mask = np.ones_like(stacked_matrix)
+    data_mask[(stacked_matrix == 0) | np.isnan(stacked_matrix)] = 0
+    
+    return np.concatenate([
+        data_mask[np.newaxis, ...],  # Mask channel
+        stacked_matrix[np.newaxis, ...]  # Data channel
+    ], axis=0)
