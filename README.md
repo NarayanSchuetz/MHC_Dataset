@@ -28,6 +28,11 @@ pip install git+https://github.com/NarayanSchuetz/SlurmMultiNodePool.git
 Currently the code is designed to be run on a SLURM cluster (specifically the Stanford Sherlock cluster).
 In the file `run_on_sherlock.ipynb` we have an example of how to run the code on a single user_id (one user). As well as how to run it on a cluster. Make sure that the folder structure of the input data is correct. Or adjust the dataloader.
 
+## Pipeline
+Without going into too much detail, the pre-processing pipeline mostly follows the logic displayed below:
+
+![Processing Schematic](./processing_schematic.png)
+
 ## Resulting Dataset
 
 The dataset is stored in the specfified output folder e.g. `data/mhc`.
