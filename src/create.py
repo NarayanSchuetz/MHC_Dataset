@@ -13,21 +13,20 @@ from metadata import calculate_data_coverage, compute_array_statistics
 def _adjust_start_time(row):
     try:
         if pd.isna(row['startTime_timezone_offset']):
-            return row['startTime']
-        adjusted_time = row['startTime'] + pd.Timedelta(minutes=row['startTime_timezone_offset'])
-        return pd.to_datetime(adjusted_time)
+            return pd.to_datetime(row['startTime'])
+        adjusted_time = pd.to_datetime(row['startTime']) + pd.Timedelta(minutes=row['startTime_timezone_offset'])
+        return adjusted_time
     except:
-        return row['startTime']
-
+        return pd.to_datetime(row['startTime'])
 
 def _adjust_end_time(row):
     try:
         if pd.isna(row['endTime_timezone_offset']):
-            return row['endTime']
-        adjusted_time = row['endTime'] + pd.Timedelta(minutes=row['endTime_timezone_offset'])
-        return pd.to_datetime(adjusted_time)
+            return pd.to_datetime(row['endTime'])
+        adjusted_time = pd.to_datetime(row['endTime']) + pd.Timedelta(minutes=row['endTime_timezone_offset'])
+        return adjusted_time
     except:
-        return row['endTime']
+        return pd.to_datetime(row['endTime'])
     
 
 def _adjust_end_time_motion(row):
@@ -71,24 +70,32 @@ def _get_average_values_healthkit(df_healthkit):
 
 
 def _set_time(df, file_type: FileType):
-    if file_type == FileType.HEALTHKIT:
-        df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
-        df['endTime'] = df.apply(_adjust_end_time, axis=1).dt.tz_localize(None)
-        df.index = df['startTime']
+    try:
+        if file_type == FileType.HEALTHKIT:
+            df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
+            df['endTime'] = df.apply(_adjust_end_time, axis=1).dt.tz_localize(None)
+            df.index = df['startTime']
 
-    elif file_type == FileType.MOTION:
-        df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
-        df['endTime'] = df.apply(_adjust_end_time_motion, axis=1).dt.tz_localize(None)
-        df.index = df['startTime']
+        elif file_type == FileType.MOTION:
+            df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
+            df['endTime'] = df.apply(_adjust_end_time_motion, axis=1).dt.tz_localize(None)
+            df.index = df['startTime']
 
-    elif file_type == FileType.WORKOUT:
-        df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
-        df['endTime'] = df.apply(_adjust_end_time, axis=1).dt.tz_localize(None)
-        df.index = df['startTime']
+        elif file_type == FileType.WORKOUT:
+            df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
+            df['endTime'] = df.apply(_adjust_end_time, axis=1).dt.tz_localize(None)
+            df.index = df['startTime']
 
-    elif file_type == FileType.SLEEP:
-        df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
-        df.index = df['startTime']
+        elif file_type == FileType.SLEEP:
+            df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
+            df.index = df['startTime']
+    except Exception as e:
+        print("_"*50)
+        print("Is empty", df.empty)
+        print(df.columns)
+        print(df.head())
+        print(file_type)
+        raise e
 
 
 def _generate_minute_level_data_factory(file_type: FileType):
@@ -134,6 +141,7 @@ def create_dataset(
         - Combines them into a single numpy array
         - Saves the array to a .npy file named YYYY-MM-DD.npy
     """
+
     # Check if metadata file exists and we're not forcing recompute
     metadata_filepath = os.path.join(output_root_dir, "metadata.parquet")
     if os.path.exists(metadata_filepath) and not force_recompute:
@@ -154,6 +162,9 @@ def create_dataset(
             raise ValueError(f"Missing synthetic data for {file_type}")
 
         dfs[file_type] = filter_fn(dfs[file_type])
+
+        if dfs[file_type].empty:
+            continue
         
         # Adjust times based on file type
         _set_time(dfs[file_type], file_type)
@@ -190,7 +201,7 @@ def create_dataset(
 
         if df_hk.empty:
             # we don't want to generate data where even the HealthKit data is missing (by far the most common data type)
-            continue
+            return
 
         daily_minute_level_matrix = []
 
