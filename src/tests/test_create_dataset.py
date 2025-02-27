@@ -492,4 +492,3 @@ class TestCreateDatasetSynthetic:
         steps_row = metadata_date2.iloc[0]
         assert np.isclose(steps_row["data_coverage"], 60/1440 * 100), \
             "Incorrect data coverage for steps on date2"
-

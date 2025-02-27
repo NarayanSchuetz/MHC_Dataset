@@ -58,8 +58,8 @@ def compute_array_statistics(daily_minute_level_matrix):
     
     # Only sum values where mask is 1
     masked_data = data * mask
-    sum_values = np.sum(masked_data, axis=1)
-    sum_of_squares = np.sum((masked_data ** 2), axis=1)
+    sum_values = np.nansum(masked_data, axis=1)
+    sum_of_squares = np.nansum((masked_data ** 2), axis=1)
     
     # Create DataFrame with results
     return pd.DataFrame({
