@@ -5,11 +5,11 @@
 #SBATCH --job-name=mhc_dataset_creation
 #SBATCH --output=/scratch/users/schuetzn/logs/mhc_dataset_creation/%j.log
 #SBATCH --time=16:10:00
-#SBATCH --mem=16G
+#SBATCH --mem=64G
 #SBATCH --cpus-per-task=1
 #SBATCH --mail-type=FAIL
 #SBATCH --mail-user=schuetzn@stanford.edu
-#SBATCH --array=0-499
+#SBATCH --array=0-49
 
 # load modules, adjust to your needs
 ml devel
