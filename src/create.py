@@ -204,7 +204,7 @@ def create_dataset(
             daily_minute_level_matrix = np.load(output_filepath)
         else:
             if df_hk.empty:
-                return  # Skip user if no HealthKit data
+                continue  # Skip day if no HealthKit data
             daily_minute_level_matrix = _generate_daily_data(dfs_dict_daily, date, skip)
             np.save(output_filepath, daily_minute_level_matrix)
 
