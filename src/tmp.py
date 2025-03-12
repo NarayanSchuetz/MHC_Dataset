@@ -41,7 +41,7 @@ def main(user_id):
         },  
         output_root_dir=output_dir,
         force_recompute=False,
-        force_recompute_metadata=True,
+        force_recompute_metadata=False,
     )
 
 

@@ -4,7 +4,7 @@
 #SBATCH --partition=owners
 #SBATCH --job-name=mhc_dataset_creation
 #SBATCH --output=/scratch/users/schuetzn/logs/mhc_dataset_creation/%j.log
-#SBATCH --time=16:10:00
+#SBATCH --time=48:00:00
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=1
 #SBATCH --mail-type=FAIL
