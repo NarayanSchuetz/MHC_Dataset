@@ -4,7 +4,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from create import _generate_healthkit_minute_level_daily_data, _generate_sleep_minute_level_daily_data, _generate_motion_minute_level_daily_data, _generate_workout_minute_level_daily_data
+from create import (
+    _generate_healthkit_minute_level_daily_data, 
+    _generate_sleep_minute_level_daily_data, 
+    _generate_motion_minute_level_daily_data, 
+    _generate_workout_minute_level_daily_data,
+    _convert_healthkit_units
+)
 from constants import HKQuantityType, MotionActivityType, HKWorkoutType
 
 
@@ -39,6 +45,129 @@ def load_test_dataframe():
     df_dummy = pd.DataFrame(data)
     df_dummy.index = df_dummy["startTime"]
     return df_dummy
+
+
+class TestConvertHealthKitUnits:
+
+    def test_empty_dataframe(self):
+        """Test that an empty DataFrame is returned unchanged."""
+        df_empty = pd.DataFrame(columns=['value', 'unit'])
+        df_converted = _convert_healthkit_units(df_empty)
+        pd.testing.assert_frame_equal(df_empty, df_converted)
+
+    def test_no_unit_column(self):
+        """Test that a DataFrame without a 'unit' column is returned unchanged."""
+        df_no_unit = pd.DataFrame({'value': [100]})
+        df_converted = _convert_healthkit_units(df_no_unit)
+        pd.testing.assert_frame_equal(df_no_unit, df_converted)
+
+    def test_count_per_second_no_conversion(self):
+        """Test that count/s is NOT converted (as the code is commented out)."""
+        df_input = pd.DataFrame({'value': [1.0], 'unit': ['count/s']})
+        df_expected = pd.DataFrame({'value': [1.0], 'unit': ['count/s']}) # Expect no change
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted)
+
+    def test_calories_no_conversion(self):
+        """Test that cal is NOT converted to Cal (kcal) (as the code is commented out)."""
+        df_input = pd.DataFrame({'value': [5000.0], 'unit': ['cal']})
+        df_expected = pd.DataFrame({'value': [5000.0], 'unit': ['cal']}) # Expect no change
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted, check_exact=False, rtol=1e-5)
+
+    def test_kilocalories_no_conversion(self):
+        """Test that kcal is NOT converted to Cal (kcal) (as the code is commented out)."""
+        df_input = pd.DataFrame({'value': [5.0], 'unit': ['kcal']})
+        df_expected = pd.DataFrame({'value': [5.0], 'unit': ['kcal']}) # Expect no change
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted)
+
+    def test_feet_to_meters(self):
+        """Test conversion from feet (ft) to meters (m)."""
+        df_input = pd.DataFrame({'value': [10.0], 'unit': ['ft']})
+        df_expected = pd.DataFrame({'value': [10.0 * 0.3048], 'unit': ['m']})
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted, check_exact=False, rtol=1e-5)
+
+    def test_inches_to_meters(self):
+        """Test conversion from inches (in) to meters (m)."""
+        df_input = pd.DataFrame({'value': [12.0], 'unit': ['in']})
+        df_expected = pd.DataFrame({'value': [12.0 * 0.0254], 'unit': ['m']})
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted, check_exact=False, rtol=1e-5)
+
+    def test_cm_to_meters(self):
+        """Test conversion from centimeters (cm) to meters (m)."""
+        df_input = pd.DataFrame({'value': [175.0], 'unit': ['cm']})
+        df_expected = pd.DataFrame({'value': [1.75], 'unit': ['m']})
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted, check_exact=False, rtol=1e-5)
+
+    def test_km_to_meters(self):
+        """Test conversion from kilometers (km) to meters (m)."""
+        df_input = pd.DataFrame({'value': [5.0], 'unit': ['km']})
+        df_expected = pd.DataFrame({'value': [5000.0], 'unit': ['m']})
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted, check_exact=False, rtol=1e-5)
+
+    def test_miles_to_meters(self):
+        """Test conversion from miles (mi) to meters (m)."""
+        df_input = pd.DataFrame({'value': [1.0], 'unit': ['mi']})
+        df_expected = pd.DataFrame({'value': [1609.34], 'unit': ['m']})
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted, check_exact=False, rtol=1e-5)
+
+    def test_pounds_to_kilograms(self):
+        """Test conversion from pounds (lb) to kilograms (kg)."""
+        df_input = pd.DataFrame({'value': [150.0], 'unit': ['lb']})
+        df_expected = pd.DataFrame({'value': [150.0 * 0.45359237], 'unit': ['kg']})
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted, check_exact=False, rtol=1e-5)
+
+    def test_grams_to_kilograms(self):
+        """Test conversion from grams (g) to kilograms (kg)."""
+        df_input = pd.DataFrame({'value': [750.0], 'unit': ['g']})
+        df_expected = pd.DataFrame({'value': [0.75], 'unit': ['kg']})
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted, check_exact=False, rtol=1e-5)
+
+    def test_mph_to_mps(self):
+        """Test conversion from miles per hour (mph) to meters per second (m/s)."""
+        df_input = pd.DataFrame({'value': [60.0], 'unit': ['mph']})
+        df_expected = pd.DataFrame({'value': [60.0 * 0.44704], 'unit': ['m/s']})
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted, check_exact=False, rtol=1e-5)
+
+    def test_floz_to_liters(self):
+        """Test conversion from fluid ounces (fl_oz) to liters (L)."""
+        df_input = pd.DataFrame({'value': [33.814], 'unit': ['fl_oz']}) # Approx 1 Liter
+        df_expected = pd.DataFrame({'value': [33.814 * 0.0295735], 'unit': ['L']})
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted, check_exact=False, rtol=1e-5)
+
+    def test_mixed_units(self):
+        """Test a DataFrame with multiple different units, some converted, some not."""
+        df_input = pd.DataFrame({
+            'value': [1.0, 5000.0, 10.0, 150.0, 60.0],
+            'unit': ['count/s', 'cal', 'ft', 'lb', 'mph']
+        })
+        # count/s and cal are NOT converted anymore
+        df_expected = pd.DataFrame({
+            'value': [1.0, 5000.0, 10.0 * 0.3048, 150.0 * 0.45359237, 60.0 * 0.44704],
+            'unit': ['count/s', 'cal', 'm', 'kg', 'm/s']
+        })
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted, check_exact=False, rtol=1e-5)
+
+    def test_unconverted_units(self):
+        """Test that units not specified for conversion remain unchanged."""
+        df_input = pd.DataFrame({
+            'value': [100.0, 70.0, 12.0, 5.0], # Added kcal
+            'unit': ['bpm', 'm', 'kg', 'kcal'] # bpm is not converted, m and kg are already target units, kcal is not converted
+        })
+        df_expected = df_input.copy() # Expect it to be identical
+        df_converted = _convert_healthkit_units(df_input)
+        pd.testing.assert_frame_equal(df_expected, df_converted)
 
 
 class TestGenerateSleepMinuteLevelDailyData:

@@ -43,19 +43,96 @@ def _get_seconds_till_midnight(datetime: pd.Timestamp):
     return datetime.hour*60*60 + datetime.minute*60 + datetime.second
 
 
+def _convert_healthkit_units(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert HealthKit units to standardized units (SI where applicable).
+    Returns a copy of the DataFrame with converted units.
+    """
+    # Create a copy to avoid modifying the original
+    df = df.copy()
+
+    if df.empty or 'unit' not in df.columns:
+        return df
+    
+    # Convert counts per second to counts per minute
+    # mask_counts = df['unit'] == 'count/s'
+    # df.loc[mask_counts, 'value'] *= 60
+    # df.loc[mask_counts, 'unit'] = 'count/min'
+    
+    # Convert calories to Calories (kcal)  -- TODO: Clarify when we should convert this
+    # mask_cal = df['unit'] == 'cal'
+    # df.loc[mask_cal, 'value'] /= 1000
+    # df.loc[mask_cal, 'unit'] = 'Cal' # Note: Using 'Cal' to represent kcal for consistency
+    
+    # Convert calories to Calories (kcal) - ensure consistency
+    # mask_kcal = df['unit'] == 'kcal'
+    # df.loc[mask_kcal, 'unit'] = 'Cal' # Map kcal also to 'Cal'
+
+    # Convert all length measurements to meters
+    mask_feet = df['unit'] == 'ft'
+    df.loc[mask_feet, 'value'] *= 0.3048
+    df.loc[mask_feet, 'unit'] = 'm'
+    
+    mask_inches = df['unit'] == 'in'
+    df.loc[mask_inches, 'value'] *= 0.0254
+    df.loc[mask_inches, 'unit'] = 'm'
+    
+    mask_cm = df['unit'] == 'cm'
+    df.loc[mask_cm, 'value'] /= 100
+    df.loc[mask_cm, 'unit'] = 'm'
+    
+    mask_km = df['unit'] == 'km'
+    df.loc[mask_km, 'value'] *= 1000
+    df.loc[mask_km, 'unit'] = 'm'
+
+    mask_mi = df['unit'] == 'mi'
+    df.loc[mask_mi, 'value'] *= 1609.34
+    df.loc[mask_mi, 'unit'] = 'm'
+
+    # Convert all mass measurements to kilograms
+    mask_pounds = df['unit'] == 'lb'
+    df.loc[mask_pounds, 'value'] *= 0.45359237
+    df.loc[mask_pounds, 'unit'] = 'kg'
+    
+    mask_grams = df['unit'] == 'g'
+    df.loc[mask_grams, 'value'] /= 1000
+    df.loc[mask_grams, 'unit'] = 'kg'
+    
+    # Convert speed to meters per second
+    mask_mph = df['unit'] == 'mph'
+    df.loc[mask_mph, 'value'] *= 0.44704
+    df.loc[mask_mph, 'unit'] = 'm/s'
+    
+    # Convert volume to liters
+    mask_floz = df['unit'] == 'fl_oz'
+    df.loc[mask_floz, 'value'] *= 0.0295735
+    df.loc[mask_floz, 'unit'] = 'L'
+    
+    return df
+
+
 def _get_average_values_healthkit(df_healthkit):
     values = []
     for _, df in df_healthkit.iterrows():
         start_time = df.startTime
         end_time = df.endTime
         duration = end_time - start_time
-        if duration.total_seconds() <= 0:
+        
+        if duration.total_seconds() < 0:  # Skip negative durations
             continue
-
+            
         start_index = _get_seconds_till_midnight(start_time)
-        end_index = start_index + int(duration.total_seconds())
-        value_arr = np.full(24*60*60, np.nan, dtype=np.float32)
-        value_arr[start_index:end_index] = df.value / duration.total_seconds()
+        
+        if duration.total_seconds() == 0:  # Handle point estimates
+            minute_start = start_index - (start_index % 60)  # Round down to start of minute
+            minute_end = minute_start + 60  # End of the minute
+            value_arr = np.full(24*60*60, np.nan, dtype=np.float32)
+            value_arr[minute_start:minute_end] = df.value
+        else:  # Handle normal duration measurements
+            end_index = start_index + int(duration.total_seconds())
+            value_arr = np.full(24*60*60, np.nan, dtype=np.float32)
+            value_arr[start_index:end_index] = df.value / duration.total_seconds()
+            
         values.append(value_arr)
     
     if len(values) == 0:
@@ -89,6 +166,7 @@ def _set_time(df, file_type: FileType):
         elif file_type == FileType.SLEEP:
             df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
             df.index = df['startTime']
+
     except Exception as e:
         print("_"*50)
         print("Is empty", df.empty)
@@ -130,97 +208,185 @@ def create_dataset(
         skip (List[FileType], optional): List of FileTypes to skip processing. Defaults to empty list.
         force_recompute (bool, optional): If True, recompute and overwrite existing output files.
             If False, skip dates that already have output files. Defaults to False.
+        force_recompute_metadata (bool, optional): If True, recompute and overwrite existing metadata file.
+            Defaults to False.
 
     The function:
     1. Creates the output directory if it doesn't exist
-    2. Applies filters based on file type before modifying timestamps or splitting intervals
-    3. Processes timestamps and timezone offsets for each data type
-    4. Splits multi-day intervals at midnight boundaries
-    5. Groups data by date
-    6. For each date with HealthKit data:
+    2. Converts units for HealthKit data
+    3. Applies filters based on file type before modifying timestamps or splitting intervals
+    4. Processes timestamps and timezone offsets for each data type
+    5. Splits multi-day intervals at midnight boundaries
+    6. Groups data by date
+    7. For each date with HealthKit data:
         - Generates minute-level arrays for each data type
         - Combines them into a single numpy array
         - Saves the array to a .npy file named YYYY-MM-DD.npy
+    8. Calculates and saves metadata for the processed days.
     """
 
     # Check if metadata file exists and we're not forcing recompute
     metadata_filepath = os.path.join(output_root_dir, "metadata.parquet")
-    if os.path.exists(metadata_filepath) and not force_recompute_metadata:
-        print(f"Skipping metadata recomputation for {output_root_dir} because it already exists.")
+    if os.path.exists(metadata_filepath) and not force_recompute_metadata and not force_recompute:
+        print(f"Skipping dataset and metadata creation for {output_root_dir} because metadata.parquet already exists and force flags are False.")
         return
     
     # Create output directory if it doesn't exist
     os.makedirs(output_root_dir, exist_ok=True)
     
-    # Process each file type: adjust times and split intervals at midnight boundaries.
+    # Convert units ONLY for HealthKit DataFrame before any other processing
+    processed_dfs = {}
+    for file_type, df in dfs.items():
+        if file_type in skip:
+            continue
+        
+        if file_type == FileType.HEALTHKIT:
+            processed_dfs[file_type] = _convert_healthkit_units(df)
+        else:
+            # For other file types, just copy the DataFrame
+            processed_dfs[file_type] = df.copy() 
+            
+    # Process each file type: filter, adjust times, and split intervals at midnight boundaries.
     for file_type in FileType:
         if file_type in skip:
             continue
 
+        # Check if the file_type exists after potential skipping/unit conversion
+        if file_type not in processed_dfs:
+            print(f"Skipping {file_type} because it is not in the processed dictionary (likely missing input or skipped).")
+            # Ensure it's handled gracefully later if needed, e.g., during daily data generation
+            continue 
+
         filter_fn = FilterFactory.create_filter(file_type.value)
-        if file_type not in dfs:
-            print(f"Skipping {file_type} because it is not in the input dictionary.")
-            print(f"Input dictionary keys: {dfs.keys()}")
-            raise ValueError(f"Missing synthetic data for {file_type}")
+        # Apply filtering to the potentially converted DataFrame
+        processed_dfs[file_type] = filter_fn(processed_dfs[file_type]) 
 
-        dfs[file_type] = filter_fn(dfs[file_type])
-
-        if dfs[file_type].empty:
-            continue
+        if processed_dfs[file_type].empty:
+            print(f"DataFrame for {file_type.value} is empty after filtering.")
+            continue # Skip time/interval processing if empty
         
         # Adjust times based on file type
-        _set_time(dfs[file_type], file_type)
+        _set_time(processed_dfs[file_type], file_type)
         
         # Split intervals: sleep uses a different split method.
         if file_type == FileType.SLEEP:
-            dfs[file_type] = split_sleep_intervals_at_midnight(dfs[file_type])
+            processed_dfs[file_type] = split_sleep_intervals_at_midnight(processed_dfs[file_type])
         else:
-            dfs[file_type] = split_intervals_at_midnight(dfs[file_type])
-    
-    # Create a dictionary to store daily resampled DataFrames for each file type
+            # Ensure endTime exists before splitting
+            if 'endTime' in processed_dfs[file_type].columns:
+                 processed_dfs[file_type] = split_intervals_at_midnight(processed_dfs[file_type])
+            else:
+                 print(f"Warning: 'endTime' column missing for {file_type.value}, skipping interval splitting.")
+
+    # Use processed_dfs instead of dfs for the rest of the function
     dfs_dict_daily = {}
     
     for file_type in FileType:
         if file_type in skip:
             continue
         
-        df = dfs[file_type]
+        # Use the processed DataFrame, default to empty if not present
+        df = processed_dfs.get(file_type, pd.DataFrame()) 
         if df.empty:
             dfs_dict_daily[file_type] = {}
             continue
         
         # Group by date (using the adjusted timestamps as index)
+        # Ensure index is datetime before grouping
+        if not pd.api.types.is_datetime64_any_dtype(df.index):
+             print(f"Warning: Index for {file_type.value} is not datetime. Attempting conversion.")
+             try:
+                 df.index = pd.to_datetime(df.index)
+             except Exception as e:
+                 print(f"Error converting index for {file_type.value} to datetime: {e}. Skipping grouping.")
+                 dfs_dict_daily[file_type] = {}
+                 continue
+
         daily_dfs = {date: group for date, group in df.groupby(df.index.date)}
         dfs_dict_daily[file_type] = daily_dfs
 
+    # Determine the set of all dates present across all data types *after* processing
+    all_dates = set()
+    for daily_map in dfs_dict_daily.values():
+        all_dates.update(daily_map.keys())
+
+    if not all_dates:
+        print("No dates found with data after processing. Exiting dataset creation.")
+        return
+
+    print(f"Processing data for {len(all_dates)} unique dates.")
+    
     metadata_collection = []    
-    for date, df_hk in dfs_dict_daily[FileType.HEALTHKIT].items():
-        original_time_offset = df_hk.iloc[0]['startTime_timezone_offset']
+    # Ensure we iterate through all dates that have *any* data
+    for date in sorted(list(all_dates)): 
+        # Check if HealthKit data exists for the day, as it's used for timezone offset and filename
+        if FileType.HEALTHKIT not in skip and FileType.HEALTHKIT in dfs_dict_daily and date in dfs_dict_daily[FileType.HEALTHKIT]:
+            df_hk_day = dfs_dict_daily[FileType.HEALTHKIT][date]
+            # Use timezone offset from the first record of the day's HealthKit data if available
+            original_time_offset = df_hk_day.iloc[0]['startTime_timezone_offset'] if not df_hk_day.empty and 'startTime_timezone_offset' in df_hk_day.columns else 0
+        else:
+            # If no HealthKit data for the day, or HealthKit is skipped, proceed but maybe log/warn?
+            # We need a fallback or decision on how to handle timezone if HK is missing/skipped.
+            # For now, assume 0, but this might need refinement based on requirements.
+            original_time_offset = 0 
+            print(f"Warning: No HealthKit data found for date {date} to determine original timezone offset. Using 0.")
+
         output_filepath = os.path.join(output_root_dir, date.strftime("%Y-%m-%d") + ".npy")
         
-        # Load existing file or generate new data
+        # Generate data or load existing file
         if os.path.exists(output_filepath) and not force_recompute:
-            print(f"Skipping {date} for output directory {output_root_dir} because it already exists.")
-            daily_minute_level_matrix = np.load(output_filepath)
+            print(f"Skipping data generation for {date} in {output_root_dir}, file exists.")
+            # Load if metadata recomputation is forced, otherwise skip metadata too if file exists
+            if force_recompute_metadata:
+                 try:
+                     daily_minute_level_matrix = np.load(output_filepath)
+                 except Exception as e:
+                     print(f"Error loading existing file {output_filepath}: {e}. Skipping metadata calculation for this date.")
+                     continue # Skip metadata calc for this date if loading fails
+            else:
+                 continue # Skip metadata calculation as well if not forcing recompute
         else:
-            if df_hk.empty:
-                continue  # Skip day if no HealthKit data
-            daily_minute_level_matrix = _generate_daily_data(dfs_dict_daily, date, skip)
-            np.save(output_filepath, daily_minute_level_matrix)
+            # Check if there's any data for this date across included file types
+            has_data_for_date = any(date in dfs_dict_daily.get(ft, {}) for ft in FileType if ft not in skip)
+            if not has_data_for_date:
+                 print(f"Skipping date {date}: No data found after processing across included file types.")
+                 continue # Skip if no data exists for this date at all
 
-        # Calculate metadata for both new and existing files
-        data_coverage = calculate_data_coverage(daily_minute_level_matrix[1])
-        stats_df = compute_array_statistics(daily_minute_level_matrix)
-        metadata_df = pd.concat([data_coverage, stats_df], axis=1)
-        metadata_df.columns = ["data_coverage", "n", "sum", "sum_of_squares"]
-        metadata_df["date"] = date
-        metadata_df["original_time_offset"] = original_time_offset
-        metadata_collection.append(metadata_df)
-    
-    # Only update metadata if we processed any files
+            print(f"Generating data for {date}...")
+            try:
+                daily_minute_level_matrix = _generate_daily_data(dfs_dict_daily, date, skip)
+                np.save(output_filepath, daily_minute_level_matrix)
+            except Exception as e:
+                print(f"Error generating or saving data for date {date}: {e}")
+                continue # Skip to next date on error
+
+        # Calculate metadata only if data was generated or loaded successfully for metadata recompute
+        if 'daily_minute_level_matrix' in locals() and daily_minute_level_matrix is not None:
+            try:
+                data_coverage = calculate_data_coverage(daily_minute_level_matrix[1]) # Use data channel for coverage
+                stats_df = compute_array_statistics(daily_minute_level_matrix)
+                # Ensure indices match before concatenating, use stats_df index as reference
+                data_coverage = data_coverage.reindex(stats_df.index) 
+                metadata_day_df = pd.concat([data_coverage, stats_df], axis=1)
+                metadata_day_df.columns = ["data_coverage", "n", "sum", "sum_of_squares"]
+                metadata_day_df["date"] = date
+                metadata_day_df["original_time_offset"] = original_time_offset
+                metadata_collection.append(metadata_day_df)
+                del daily_minute_level_matrix # Clean up memory
+            except Exception as e:
+                 print(f"Error calculating metadata for date {date}: {e}")
+                 # Decide if we should continue or stop metadata processing
+
+    # Only update metadata if we processed any files and collected metadata
     if metadata_collection:
-        metadata_df = pd.concat(metadata_collection)
-        metadata_df.to_parquet(os.path.join(output_root_dir, "metadata.parquet"))
+        print(f"Saving metadata for {len(metadata_collection)} days to {metadata_filepath}")
+        final_metadata_df = pd.concat(metadata_collection)
+        # Add index name if it doesn't exist for clarity in parquet
+        if final_metadata_df.index.name is None:
+             final_metadata_df.index.name = 'feature_index' 
+        final_metadata_df.to_parquet(metadata_filepath)
+    elif not os.path.exists(metadata_filepath) or force_recompute_metadata:
+         print("No metadata collected or generated. Metadata file might be empty or not updated.")
 
 
 def _generate_healthkit_minute_level_daily_data(df_healthkit_day, date: pd.Timestamp):

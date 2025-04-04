@@ -41,32 +41,32 @@ For each user_id a separate directory with the user_id is created. Inside this d
 
 The numpy file contains a 2 x C x 1440 array where 1440 is the number of minutes in a day and C is the number of data streams. Currently the data streams C (C=24) are:
 
-| Data Stream | Date_1 | ... | Date_1440 |
-|------|--------|-----|-----------|
-| HKQuantityTypeIdentifierStepCount |   | ... |   |
-| HKQuantityTypeIdentifierActiveEnergyBurned |   | ... |   |
-| HKQuantityTypeIdentifierDistanceWalkingRunning |   | ... |   |
-| HKQuantityTypeIdentifierDistanceCycling |   | ... |   |
-| HKQuantityTypeIdentifierAppleStandTime |   | ... |   |
-| HKQuantityTypeIdentifierHeartRate |   | ... |   |
-| stationary |   | ... |   |
-| walking |   | ... |   |
-| running |   | ... |   |
-| automotive |   | ... |   |
-| cycling |   | ... |   |
-| not available |   | ... |   |
-| HKCategoryValueSleepAnalysisAsleep |   | ... |   |
-| HKCategoryValueSleepAnalysisInBed |   | ... |   |
-| HKWorkoutActivityTypeWalking |   | ... |   |
-| HKWorkoutActivityTypeCycling |   | ... |   |
-| HKWorkoutActivityTypeRunning |   | ... |   |
-| HKWorkoutActivityTypeOther |   | ... |   |
-| HKWorkoutActivityTypeMixedMetabolicCardioTraining |   | ... |   |
-| HKWorkoutActivityTypeTraditionalStrengthTraining |   | ... |   |
-| HKWorkoutActivityTypeElliptical |   | ... |   |
-| HKWorkoutActivityTypeHighIntensityIntervalTraining |   | ... |   |
-| HKWorkoutActivityTypeFunctionalStrengthTraining |   | ... |   |
-| HKWorkoutActivityTypeYoga |   | ... |   |
+| Data Stream                                       | Date_1 | ... | Date_1440 |
+|---------------------------------------------------|--------|-----|-----------|
+| HKQuantityTypeIdentifierStepCount                 |        | ... |           |
+| HKQuantityTypeIdentifierActiveEnergyBurned        |        | ... |           |
+| HKQuantityTypeIdentifierDistanceWalkingRunning    |        | ... |           |
+| HKQuantityTypeIdentifierDistanceCycling           |        | ... |           |
+| HKQuantityTypeIdentifierAppleStandTime            |        | ... |           |
+| HKQuantityTypeIdentifierHeartRate                 |        | ... |           |
+| HKWorkoutActivityTypeWalking                      |        | ... |           |
+| HKWorkoutActivityTypeCycling                      |        | ... |           |
+| HKWorkoutActivityTypeRunning                      |        | ... |           |
+| HKWorkoutActivityTypeOther                        |        | ... |           |
+| HKWorkoutActivityTypeMixedMetabolicCardioTraining |        | ... |           |
+| HKWorkoutActivityTypeTraditionalStrengthTraining  |        | ... |           |
+| HKWorkoutActivityTypeElliptical                   |        | ... |           |
+| HKWorkoutActivityTypeHighIntensityIntervalTraining|        | ... |           |
+| HKWorkoutActivityTypeFunctionalStrengthTraining   |        | ... |           |
+| HKWorkoutActivityTypeYoga                         |        | ... |           |
+| HKCategoryValueSleepAnalysisAsleep                |        | ... |           |
+| HKCategoryValueSleepAnalysisInBed                 |        | ... |           |
+| stationary                                        |        | ... |           |
+| walking                                           |        | ... |           |
+| running                                           |        | ... |           |
+| automotive                                        |        | ... |           |
+| cycling                                           |        | ... |           |
+| not available                                     |        | ... |           |
 
 The first index (0) of the 3D-tensor's first dimension contains an indicator mask (1=observed data; 0=no observed data) of the same size as the second index (the actual per minute data) matrix.
 The second index (1) of the tensor first tensor dimension contains the actual per minute data.

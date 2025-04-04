@@ -302,7 +302,8 @@ def apple_stand_time_filter(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         The DataFrame with invalid Apple Stand Time records removed.
     """
-    __MAX_STAND_RATE = 1
+    __MAX_STAND_RATE = 1  # cannot have more than 1 minute of stand time per minute :)
+    __MIN_STAND_RATE = 0  # cannot have negative stand time
 
     if df.empty:
         return df
@@ -323,9 +324,9 @@ def apple_stand_time_filter(df: pd.DataFrame) -> pd.DataFrame:
         stand_values = df.iloc[stand_indices]['value'].to_numpy(dtype=float) * 60
         stand_rate = stand_values / durations
         
-        valid[stand_indices] = (stand_values >= 0) & (stand_rate <= __MAX_STAND_RATE)
+        valid[stand_indices] = (stand_values >= __MIN_STAND_RATE) & (stand_values <= __MAX_STAND_RATE) & (stand_rate <= __MAX_STAND_RATE)
     else:
-        valid[stand_indices] = df.iloc[stand_indices]['value'].to_numpy(dtype=float) >= 0
+        valid[stand_indices] = (df.iloc[stand_indices]['value'].to_numpy(dtype=float) >= __MIN_STAND_RATE) & (df.iloc[stand_indices]['value'].to_numpy(dtype=float) <= __MAX_STAND_RATE)
 
     return df.iloc[valid]
 
@@ -339,8 +340,8 @@ def heart_rate_filter(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         The DataFrame with invalid heart rate records removed.
     """
-    MIN_HEART_RATE = 40
-    MAX_HEART_RATE = 200
+    MIN_HEART_RATE = 40/60  # 40 beats per minute = 0.67 beats per second
+    MAX_HEART_RATE = 200/60  # 200 beats per minute = 3.33 beats per second
 
     if df.empty:
         return df
