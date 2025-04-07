@@ -266,7 +266,7 @@ def distance_cycling_filter(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         The DataFrame with invalid cycling distance records removed.
     """
-    __MAX_DISTANCE_PER_SECOND = 10
+    __MAX_DISTANCE_PER_SECOND = 25
 
     if df.empty:
         return df

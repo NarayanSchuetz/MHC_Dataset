@@ -2,7 +2,7 @@
 
 ## Setup
 
-Create a virtual environment and install the dependencies.
+Create a virtual environment and install the dependencies (make sure you work with a more recent Python release > 3.7).
 
 ```bash
 python -m venv venv
