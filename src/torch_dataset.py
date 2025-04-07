@@ -162,7 +162,7 @@ class BaseMhcDataset(Dataset):
 
         # 2. Create a lookup for provided files based on date
         provided_files_map = {}
-        participant_dir = self.root_dir / health_code
+        participant_dir = self.root_dir / health_code # <-- This line is kept for context but is no longer used in the loop below for constructing the full path
         # Handle cases where file_uris might be NaN or not a list
         if isinstance(file_uris_list, list):
             for uri in file_uris_list:
@@ -173,8 +173,8 @@ class BaseMhcDataset(Dataset):
                     date_str = filename.split('.npy')[0]
                     # Validate date format extracted from filename
                     datetime.strptime(date_str, "%Y-%m-%d")
-                    # Store full path against date string
-                    provided_files_map[date_str] = participant_dir / uri # Construct full path
+                    # Store full path against date string - CORRECTED LINE:
+                    provided_files_map[date_str] = self.root_dir / uri # Construct full path directly from root_dir and uri
                 except (ValueError, IndexError):
                      # Log warning for files that cannot be parsed, skip them
                      logger.warning(f"Could not parse date from file URI '{uri}' for sample {idx}. Skipping this file.")
