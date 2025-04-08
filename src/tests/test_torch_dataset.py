@@ -66,11 +66,11 @@ class TestMhcDatasets(unittest.TestCase):
                 "2023-02-01_2023-02-01", # P2: file_uris is NaN
             ],
             'file_uris': [
-                ["data/2023-01-15.npy", "2023-01-16.npy"], # Corresponds to time_range 0
-                ["data/2023-01-15.npy", "2023-01-16.npy"], # Corresponds to time_range 1 (day 17 not listed)
-                ["2023-01-17_wrong_shape.npy"],          # Corresponds to time_range 2
-                ["2023-02-01.npy", "nonexistent/2023-02-02.npy"], # Corresponds to time_range 3 (one exists, one doesn't)
-                ["2023-01-18_wrong_dims.npy"],           # Corresponds to time_range 4
+                ["healthCode1/data/2023-01-15.npy", "healthCode1/2023-01-16.npy"], # Corresponds to time_range 0
+                ["healthCode1/data/2023-01-15.npy", "healthCode1/2023-01-16.npy"], # Corresponds to time_range 1 (day 17 not listed)
+                ["healthCode1/2023-01-17_wrong_shape.npy"],          # Corresponds to time_range 2
+                ["healthCode2/2023-02-01.npy", "healthCode2/nonexistent/2023-02-02.npy"], # Corresponds to time_range 3 (one exists, one doesn't)
+                ["healthCode1/2023-01-18_wrong_dims.npy"],           # Corresponds to time_range 4
                 [],                                      # Corresponds to time_range 5
                 np.nan,                                  # Corresponds to time_range 6
             ],
@@ -113,6 +113,11 @@ class TestMhcDatasets(unittest.TestCase):
 
     def test_base_init_warns_on_string_list_uris(self):
          """Test initialization warns if file_uris contains string representations of lists."""
+         # Make a version of the dataset with string representations of the updated URIs
+         data_str_uris = self.df.copy()
+         data_str_uris['file_uris'] = [str(x) if isinstance(x, list) else x for x in data_str_uris['file_uris']]
+         self.df_str_uris = pd.DataFrame(data_str_uris)
+         
          with self.assertWarnsRegex(UserWarning, "Consider pre-processing"): # Check if the warning is raised
              dataset = BaseMhcDataset(self.df_str_uris, self.root_dir)
              # Also check if it still processes correctly
@@ -156,7 +161,7 @@ class TestMhcDatasets(unittest.TestCase):
         # Check metadata
         self.assertEqual(sample['metadata']['healthCode'], "healthCode1")
         self.assertEqual(sample['metadata']['time_range'], "2023-01-15_2023-01-16")
-        self.assertEqual(sample['metadata']['file_uris'], ["data/2023-01-15.npy", "2023-01-16.npy"])
+        self.assertEqual(sample['metadata']['file_uris'], ["healthCode1/data/2023-01-15.npy", "healthCode1/2023-01-16.npy"])
 
     def test_base_getitem_missing_day_in_range(self):
         """Test __getitem__ handles missing days within the time range."""
@@ -182,7 +187,7 @@ class TestMhcDatasets(unittest.TestCase):
     def test_base_getitem_file_listed_but_not_found(self):
         """Test __getitem__ handles files in file_uris but not found on disk."""
         dataset = BaseMhcDataset(self.df, self.root_dir)
-        idx = 3 # P2: ["2023-02-01.npy", "nonexistent/2023-02-02.npy"]
+        idx = 3 # P2: ["healthCode2/2023-02-01.npy", "healthCode2/nonexistent/2023-02-02.npy"]
         sample = dataset[idx]
 
         self.assertEqual(sample['data'].shape, (2, 24, 1440)) # 2 days
