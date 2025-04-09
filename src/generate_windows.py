@@ -72,20 +72,81 @@ def get_file_uris_for_window(base_path, user_id, window_start, window_end):
     return file_uris
 
 
-def process_user(user_id, base_path):
+def meets_coverage_criteria(day_data, min_channel_coverage=None, min_channels_with_data=None):
+    """
+    Check if a single day's data meets the coverage criteria. This function evaluates whether
+    a day's sensor data has sufficient quality based on two possible criteria:
+    1. Channel coverage percentage - checks if any channel has at least the minimum required coverage
+    2. Number of channels with data - checks if enough distinct channels have any data at all
+    
+    The function can apply either or both criteria depending on which parameters are provided.
+    
+    Args:
+        day_data: DataFrame containing metadata for a single day
+        min_channel_coverage: Minimum percentage coverage required per channel, if None no coverage check is applied
+        min_channels_with_data: Minimum number of channels that must have coverage > 0, if None no channel count check is applied
+        
+    Returns:
+        bool: True if the day meets criteria, False otherwise
+    """
+    # If both criteria are None, no filtering is applied
+    if min_channel_coverage is None and min_channels_with_data is None:
+        return True
+    
+    channels_with_data = sum(day_data['data_coverage'] > 0)
+    
+    # Check coverage criteria if specified
+    if min_channel_coverage is not None:
+        # Check if any channel meets the minimum coverage requirement
+        any_channel_meets_min_coverage = any(day_data['data_coverage'] >= min_channel_coverage)
+        
+        # If no channel meets the minimum coverage, the day doesn't meet criteria
+        if not any_channel_meets_min_coverage:
+            return False
+    
+    # Check channel count criteria if specified
+    if min_channels_with_data is not None:
+        return channels_with_data >= min_channels_with_data
+    
+    return True
+
+
+def get_valid_dates(metadata_df, min_channel_coverage=None, min_channels_with_data=None):
+    """
+    Filter metadata to find dates that meet the coverage criteria.
+    
+    Args:
+        metadata_df: DataFrame containing metadata for all days
+        min_channel_coverage: Minimum percentage coverage required per channel
+        min_channels_with_data: Minimum number of channels that must have coverage > 0
+        
+    Returns:
+        list: Sorted list of datetime objects for valid dates
+    """
+    valid_dates = []
+    
+    for date, day_data in metadata_df.groupby('date'):
+        if meets_coverage_criteria(day_data, min_channel_coverage, min_channels_with_data):
+            valid_dates.append(pd.to_datetime(date))
+    
+    return sorted(valid_dates)
+
+
+def process_user(user_id, base_path, min_channel_coverage=10.0, min_channels_with_data=3):
     """
     For a single user, find all valid 7-day windows (non-overlapping) with
-    >= MIN_REQUIRED_DAYS of data. For each valid window, gather a list of
-    file URIs. Return a list of dictionaries.
+    >= MIN_REQUIRED_DAYS of data that also meet coverage criteria.
     """
     metadata_df = load_user_metadata(base_path, user_id)
     if metadata_df is None or metadata_df.empty:
         return []
-
-    user_dates = sorted(pd.to_datetime(metadata_df["date"].unique()))
-
-    valid_windows = find_non_overlapping_7day_windows(user_dates)
-
+    
+    # Get valid dates based on coverage criteria
+    valid_dates = get_valid_dates(metadata_df, min_channel_coverage, min_channels_with_data)
+    
+    # Find valid windows using filtered dates
+    valid_windows = find_non_overlapping_7day_windows(valid_dates)
+    
     result_rows = []
     for start_date, end_date in valid_windows:
         start_str = start_date.strftime("%Y-%m-%d")

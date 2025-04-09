@@ -10,6 +10,8 @@ from src.generate_windows import (
     process_user,
     WINDOW_SIZE,
     MIN_REQUIRED_DAYS,
+    meets_coverage_criteria,
+    get_valid_dates,
 )
 
 
@@ -160,6 +162,76 @@ class TestGenerateWindows:
     @patch("src.generate_windows.load_user_metadata")
     @patch("src.generate_windows.find_non_overlapping_7day_windows")
     @patch("src.generate_windows.get_file_uris_for_window")
+    @patch("src.generate_windows.get_valid_dates")
+    def test_process_user_no_valid_windows(
+        self, mock_get_valid_dates, mock_get_uris, mock_find_windows, mock_load_metadata
+    ):
+        """Test processing a user with metadata but no valid windows."""
+        mock_df = pd.DataFrame({"date": [datetime(2022, 1, 1)], "data_coverage": [15.0]})
+        mock_load_metadata.return_value = mock_df
+        mock_get_valid_dates.return_value = [datetime(2022, 1, 1)]
+        mock_find_windows.return_value = []  # No valid windows
+
+        base_path = "/fake/path"
+        user_id = "test_user"
+        result = process_user(user_id, base_path)
+
+        mock_load_metadata.assert_called_once_with(base_path, user_id)
+        mock_get_valid_dates.assert_called_once_with(mock_df, 10.0, 3)
+        mock_find_windows.assert_called_once_with([datetime(2022, 1, 1)])
+        mock_get_uris.assert_not_called()
+        assert result == [], "Should return empty list when no valid windows found"
+
+    @patch("src.generate_windows.load_user_metadata")
+    @patch("src.generate_windows.find_non_overlapping_7day_windows")
+    @patch("src.generate_windows.get_file_uris_for_window")
+    @patch("src.generate_windows.get_valid_dates")
+    def test_process_user_with_valid_windows(
+        self, mock_get_valid_dates, mock_get_uris, mock_find_windows, mock_load_metadata
+    ):
+        """Test processing a user with valid windows."""
+        # Setup mock metadata
+        mock_df = pd.DataFrame({
+            "date": [datetime(2022, 1, i) for i in range(1, 8)],
+            "data_coverage": [15.0 for _ in range(7)]
+        })
+        mock_load_metadata.return_value = mock_df
+
+        # Setup valid dates after coverage filtering
+        valid_dates = [datetime(2022, 1, i) for i in range(1, 8)]
+        mock_get_valid_dates.return_value = valid_dates
+
+        # Setup mock windows
+        window_start = datetime(2022, 1, 1)
+        window_end = window_start + timedelta(days=WINDOW_SIZE - 1)
+        mock_find_windows.return_value = [(window_start, window_end)]
+
+        # Setup mock file URIs
+        file_uris = ["test_user/2022-01-01.npy", "test_user/2022-01-02.npy"]
+        mock_get_uris.return_value = file_uris
+
+        base_path = "/fake/path"
+        user_id = "test_user"
+        min_channel_coverage = 10.0
+        min_channels_with_data = 3
+        
+        result = process_user(user_id, base_path, min_channel_coverage, min_channels_with_data)
+
+        expected = [{
+            "healthCode": user_id,
+            "time_range": "2022-01-01_2022-01-07",
+            "file_uris": file_uris
+        }]
+
+        mock_load_metadata.assert_called_once_with(base_path, user_id)
+        mock_get_valid_dates.assert_called_once_with(mock_df, min_channel_coverage, min_channels_with_data)
+        mock_find_windows.assert_called_once_with(valid_dates)
+        mock_get_uris.assert_called_once_with(base_path, user_id, window_start, window_end)
+        assert result == expected, "Should return expected results for valid windows"
+
+    @patch("src.generate_windows.load_user_metadata")
+    @patch("src.generate_windows.find_non_overlapping_7day_windows")
+    @patch("src.generate_windows.get_file_uris_for_window")
     def test_process_user_no_metadata(
         self, mock_get_uris, mock_find_windows, mock_load_metadata
     ):
@@ -193,58 +265,129 @@ class TestGenerateWindows:
         mock_get_uris.assert_not_called()
         assert result == [], "Should return empty list when metadata is empty"
 
-    @patch("src.generate_windows.load_user_metadata")
-    @patch("src.generate_windows.find_non_overlapping_7day_windows")
-    @patch("src.generate_windows.get_file_uris_for_window")
-    def test_process_user_no_valid_windows(
-        self, mock_get_uris, mock_find_windows, mock_load_metadata
-    ):
-        """Test processing a user with metadata but no valid windows."""
-        mock_df = pd.DataFrame({"date": [datetime(2022, 1, 1)]})
-        mock_load_metadata.return_value = mock_df
-        mock_find_windows.return_value = []  # No valid windows
+    def test_meets_coverage_criteria_no_criteria(self):
+        """Test meets_coverage_criteria when no criteria are specified."""
+        day_data = pd.DataFrame({"data_coverage": [5.0, 15.0, 0.0]})
+        result = meets_coverage_criteria(day_data)
+        assert result is True, "Should return True when no criteria are specified"
 
-        base_path = "/fake/path"
-        user_id = "test_user"
-        result = process_user(user_id, base_path)
+    def test_meets_coverage_criteria_min_coverage_met(self):
+        """Test meets_coverage_criteria when min_channel_coverage is met."""
+        day_data = pd.DataFrame({"data_coverage": [5.0, 15.0, 0.0]})
+        result = meets_coverage_criteria(day_data, min_channel_coverage=10.0)
+        assert result is True, "Should return True when min_channel_coverage is met"
 
-        mock_load_metadata.assert_called_once_with(base_path, user_id)
-        mock_find_windows.assert_called_once()
-        mock_get_uris.assert_not_called()
-        assert result == [], "Should return empty list when no valid windows found"
+    def test_meets_coverage_criteria_min_coverage_not_met(self):
+        """Test meets_coverage_criteria when min_channel_coverage is not met."""
+        day_data = pd.DataFrame({"data_coverage": [5.0, 8.0, 0.0]})
+        result = meets_coverage_criteria(day_data, min_channel_coverage=10.0)
+        assert result is False, "Should return False when min_channel_coverage is not met"
 
-    @patch("src.generate_windows.load_user_metadata")
-    @patch("src.generate_windows.find_non_overlapping_7day_windows")
-    @patch("src.generate_windows.get_file_uris_for_window")
-    def test_process_user_with_valid_windows(
-        self, mock_get_uris, mock_find_windows, mock_load_metadata
-    ):
-        """Test processing a user with valid windows."""
-        # Setup mock metadata
-        dates = [datetime(2022, 1, i) for i in range(1, 8)]
-        mock_df = pd.DataFrame({"date": dates})
-        mock_load_metadata.return_value = mock_df
+    def test_meets_coverage_criteria_min_channels_met(self):
+        """Test meets_coverage_criteria when min_channels_with_data is met."""
+        day_data = pd.DataFrame({"data_coverage": [5.0, 15.0, 0.0]})
+        result = meets_coverage_criteria(day_data, min_channels_with_data=2)
+        assert result is True, "Should return True when min_channels_with_data is met"
 
-        # Setup mock windows
-        window_start = datetime(2022, 1, 1)
-        window_end = window_start + timedelta(days=WINDOW_SIZE - 1)
-        mock_find_windows.return_value = [(window_start, window_end)]
+    def test_meets_coverage_criteria_min_channels_not_met(self):
+        """Test meets_coverage_criteria when min_channels_with_data is not met."""
+        day_data = pd.DataFrame({"data_coverage": [5.0, 0.0, 0.0]})
+        result = meets_coverage_criteria(day_data, min_channels_with_data=2)
+        assert result is False, "Should return False when min_channels_with_data is not met"
 
-        # Setup mock file URIs
-        file_uris = ["test_user/2022-01-01.npy", "test_user/2022-01-02.npy"]
-        mock_get_uris.return_value = file_uris
+    def test_meets_coverage_criteria_both_criteria_met(self):
+        """Test meets_coverage_criteria when both criteria are met."""
+        day_data = pd.DataFrame({"data_coverage": [5.0, 15.0, 0.0]})
+        result = meets_coverage_criteria(day_data, min_channel_coverage=10.0, min_channels_with_data=2)
+        assert result is True, "Should return True when both criteria are met"
 
-        base_path = "/fake/path"
-        user_id = "test_user"
-        result = process_user(user_id, base_path)
+    def test_meets_coverage_criteria_one_criterion_not_met(self):
+        """Test meets_coverage_criteria when one criterion is not met."""
+        # Coverage criterion met, but channels criterion not met
+        day_data = pd.DataFrame({"data_coverage": [15.0, 0.0, 0.0]})
+        result = meets_coverage_criteria(day_data, min_channel_coverage=10.0, min_channels_with_data=2)
+        assert result is False, "Should return False when min_channels_with_data is not met despite min_channel_coverage being met"
+        
+        # Channels criterion met, but coverage criterion not met
+        day_data = pd.DataFrame({"data_coverage": [5.0, 8.0, 0.0]})
+        result = meets_coverage_criteria(day_data, min_channel_coverage=10.0, min_channels_with_data=2)
+        assert result is False, "Should return False when min_channel_coverage is not met despite min_channels_with_data being met"
 
-        expected = [{
-            "healthCode": user_id,
-            "time_range": "2022-01-01_2022-01-07",
-            "file_uris": file_uris
-        }]
+    def test_meets_coverage_criteria_empty_data(self):
+        """Test meets_coverage_criteria with empty data."""
+        day_data = pd.DataFrame({"data_coverage": []})
+        # With no criteria
+        result = meets_coverage_criteria(day_data)
+        assert result is True, "Should return True with empty data and no criteria"
+        
+        # With min_channel_coverage
+        result = meets_coverage_criteria(day_data, min_channel_coverage=10.0)
+        assert result is False, "Should return False with empty data and min_channel_coverage"
+        
+        # With min_channels_with_data
+        result = meets_coverage_criteria(day_data, min_channels_with_data=1)
+        assert result is False, "Should return False with empty data and min_channels_with_data"
 
-        mock_load_metadata.assert_called_once_with(base_path, user_id)
-        mock_find_windows.assert_called_once()
-        mock_get_uris.assert_called_once_with(base_path, user_id, window_start, window_end)
-        assert result == expected, "Should return expected results for valid windows"
+    @patch("src.generate_windows.meets_coverage_criteria")
+    def test_get_valid_dates(self, mock_meets_criteria):
+        """Test get_valid_dates filters dates correctly based on coverage criteria."""
+        from src.generate_windows import get_valid_dates
+        
+        # Setup dates and mock criteria responses
+        date1 = pd.Timestamp("2022-01-01")
+        date2 = pd.Timestamp("2022-01-02")
+        date3 = pd.Timestamp("2022-01-03")
+        
+        metadata_df = pd.DataFrame({
+            "date": [date1, date1, date1, date2, date2, date3, date3],
+            "data_coverage": [5.0, 15.0, 0.0, 5.0, 8.0, 12.0, 20.0]
+        })
+        
+        # Configure mock to return True for date1 and date3, False for date2
+        def side_effect(day_data, min_channel_coverage, min_channels_with_data):
+            date = day_data.iloc[0]['date']
+            return date in [date1, date3]
+        
+        mock_meets_criteria.side_effect = side_effect
+        
+        # Call the function
+        min_channel_coverage = 10.0
+        min_channels_with_data = 2
+        result = get_valid_dates(metadata_df, min_channel_coverage, min_channels_with_data)
+        
+        # Verify correct dates were returned
+        assert sorted(result) == sorted([date1, date3]), "Should return only dates that meet criteria"
+        
+        # Verify the mock was called correctly
+        assert mock_meets_criteria.call_count == 3, "Should call meets_coverage_criteria once per unique date"
+        
+    def test_get_valid_dates_integration(self):
+        """Integration test for get_valid_dates with actual meets_coverage_criteria function."""
+        from src.generate_windows import get_valid_dates
+        
+        date1 = pd.Timestamp("2022-01-01")
+        date2 = pd.Timestamp("2022-01-02")
+        date3 = pd.Timestamp("2022-01-03")
+        
+        # Create metadata with varying coverage values
+        metadata_df = pd.DataFrame({
+            "date": [date1, date1, date1, date2, date2, date3, date3],
+            "data_coverage": [5.0, 15.0, 0.0, 3.0, 4.0, 12.0, 20.0]
+        })
+        
+        # Test with different criteria
+        # Case 1: Only channel coverage criterion (date1 and date3 should pass)
+        result1 = get_valid_dates(metadata_df, min_channel_coverage=10.0, min_channels_with_data=None)
+        assert sorted(result1) == sorted([date1, date3]), "Only dates 1 and 3 have channels with ≥10% coverage"
+        
+        # Case 2: Only channels with data criterion (all dates should pass with threshold 2)
+        result2 = get_valid_dates(metadata_df, min_channel_coverage=None, min_channels_with_data=2)
+        assert sorted(result2) == sorted([date1, date2, date3]), "All dates have at least 2 channels with data"
+        
+        # Case 3: Both criteria (only date3 should pass with high thresholds)
+        result3 = get_valid_dates(metadata_df, min_channel_coverage=10.0, min_channels_with_data=2)
+        assert sorted(result3) == sorted([date1, date3]), "Only dates 1 and 3 meet both criteria"
+        
+        # Case 4: No criteria (all dates should pass)
+        result4 = get_valid_dates(metadata_df, min_channel_coverage=None, min_channels_with_data=None)
+        assert sorted(result4) == sorted([date1, date2, date3]), "All dates should pass with no criteria"
