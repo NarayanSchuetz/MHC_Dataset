@@ -334,7 +334,7 @@ class BaseMhcDataset(Dataset):
         metadata = {
             'healthCode': health_code,
             'time_range': time_range_str,
-            'file_uris': file_uris_list # Store original list
+            #'file_uris': file_uris_list # Store original list
         }
 
         # Add labels and metadata to the result dict
