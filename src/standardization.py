@@ -127,3 +127,53 @@ def calculate_standardization_from_files(metadata_filepaths: List[str]) -> pd.Da
 
     print("Standardization parameters calculated.")
     return final_params_df
+
+def save_standardization_params(params_df, output_path):
+    """
+    Save standardization parameters to a CSV file.
+    
+    Args:
+        params_df (pd.DataFrame): DataFrame containing standardization parameters
+        output_path (str): Path to save the CSV file
+    """
+    try:
+        params_df.to_csv(output_path)
+        print(f"Standardization parameters saved to {output_path}")
+    except Exception as e:
+        print(f"Error saving standardization parameters: {e}")
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+    from pathlib import Path
+    
+    parser = argparse.ArgumentParser(description='Calculate standardization parameters from statistics files.')
+    parser.add_argument('--stats_dir', required=True,
+                        help='Directory containing the statistics files')
+    parser.add_argument('--output_file', required=True,
+                        help='Path to save the standardization parameters CSV file')
+    parser.add_argument('--pattern', default='*_stats.csv',
+                        help='File pattern to match statistics files (default: *_stats.csv)')
+    
+    args = parser.parse_args()
+    
+    # Expand user paths
+    stats_dir = Path(os.path.expanduser(args.stats_dir)).resolve()
+    output_file = Path(os.path.expanduser(args.output_file)).resolve()
+    
+    # Create output directory if it doesn't exist
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    print(f"Calculating standardization parameters from files in: {stats_dir}")
+    print(f"Using file pattern: {args.pattern}")
+    
+    # Calculate standardization parameters
+    params_df = calculate_standardization_params(stats_dir, args.pattern)
+    
+    if not params_df.empty:
+        # Save parameters to CSV
+        save_standardization_params(params_df, output_file)
+        print(f"Successfully calculated standardization parameters for {len(params_df)} features.")
+    else:
+        print("No standardization parameters were calculated. Check input files and pattern.")

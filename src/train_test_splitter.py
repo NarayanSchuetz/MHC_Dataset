@@ -104,7 +104,7 @@ def stratify_and_split_by_nan_labels(df, test_size=0.2, num_bins=5, random_state
     return train_df, test_df
 
 
-def stratified_split_advanced(dataset_df, demographic_df, info_df, test_size=0.2, random_state=42, sharing_subset="all-researchers"):
+def stratified_split_advanced(dataset_df, demographic_df, info_df, test_size=0.2, random_state=42, sharing_subset=True):
     """
     Performs a stratified split on the health data by healthCode, stratifying by age and label values.
     After splitting, adds diagnostic information about demographics and label distributions.
@@ -115,12 +115,31 @@ def stratified_split_advanced(dataset_df, demographic_df, info_df, test_size=0.2
         info_df (pd.DataFrame): The info dataframe with 'healthCode' and info columns.
         test_size (float): The proportion of the dataset to include in the test split.
         random_state (int): Controls the shuffling applied to the data before applying the split.
-        sharing_subset (str): The subset of participants to include in the split.
+        sharing_subset (bool): If True, use only healthCodes that opted to share data with 'all_qualified_researchers'.
 
     Returns:
         tuple: (train_df, test_df) DataFrames with the split data.
     """
     print("Starting advanced stratified split...")
+    
+    # Filter by sharing scope if requested
+    if sharing_subset:
+        if 'sharingScope' not in info_df.columns:
+            print("WARNING: 'sharingScope' column not found in info_df. Cannot filter by sharing scope.")
+        else:
+            # Get healthCodes that opted to share with all qualified researchers
+            healthCodes_open_sharing = set(info_df[info_df.sharingScope == "all_qualified_researchers"].healthCode)
+            
+            # Filter dataset to only include these healthCodes
+            original_size = len(dataset_df)
+            dataset_df = dataset_df[dataset_df['healthCode'].isin(healthCodes_open_sharing)].copy()
+            filtered_size = len(dataset_df)
+            filtered_hcs = len(dataset_df['healthCode'].unique())
+            
+            print(f"Filtered dataset to include only healthCodes with open sharing:")
+            print(f"  Original: {original_size} records")
+            print(f"  Filtered: {filtered_size} records ({filtered_size/original_size*100:.1f}% of original)")
+            print(f"  Kept {filtered_hcs} unique healthCodes that opted for open sharing")
     
     # Process info data to get age
     info_df = info_df.copy()
@@ -412,7 +431,7 @@ def stratified_split_advanced(dataset_df, demographic_df, info_df, test_size=0.2
     return train_df, test_df
 
 
-def stratified_split_cluster(dataset_df, demographic_df, info_df, test_size=0.2, n_clusters=10, random_state=42):
+def stratified_split_cluster(dataset_df, demographic_df, info_df, test_size=0.2, n_clusters=10, random_state=42, sharing_subset=True):
     """
     Performs a stratified split on the health data by healthCode, using clustering
     on demographic features and average label values for stratification.
@@ -424,11 +443,31 @@ def stratified_split_cluster(dataset_df, demographic_df, info_df, test_size=0.2,
         test_size (float): Proportion for the test split.
         n_clusters (int): Number of clusters for K-Means.
         random_state (int): Random state for reproducibility.
+        sharing_subset (bool): If True, use only healthCodes that opted to share data with 'all_qualified_researchers'.
 
     Returns:
         tuple: (train_df, test_df)
     """
     print("Starting stratified split using clustering...")
+
+    # Filter by sharing scope if requested
+    if sharing_subset:
+        if 'sharingScope' not in info_df.columns:
+            print("WARNING: 'sharingScope' column not found in info_df. Cannot filter by sharing scope.")
+        else:
+            # Get healthCodes that opted to share with all qualified researchers
+            healthCodes_open_sharing = set(info_df[info_df.sharingScope == "all_qualified_researchers"].healthCode)
+            
+            # Filter dataset to only include these healthCodes
+            original_size = len(dataset_df)
+            dataset_df = dataset_df[dataset_df['healthCode'].isin(healthCodes_open_sharing)].copy()
+            filtered_size = len(dataset_df)
+            filtered_hcs = len(dataset_df['healthCode'].unique())
+            
+            print(f"Filtered dataset to include only healthCodes with open sharing:")
+            print(f"  Original: {original_size} records")
+            print(f"  Filtered: {filtered_size} records ({filtered_size/original_size*100:.1f}% of original)")
+            print(f"  Kept {filtered_hcs} unique healthCodes that opted for open sharing")
 
     # --- 1. Data Preparation (Similar to advanced split) ---
     # Deduplicate demographic data
@@ -622,23 +661,31 @@ def stratified_split_cluster(dataset_df, demographic_df, info_df, test_size=0.2,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Stratify and split health data by healthCode based on label completeness.')
+    import argparse
+    import os
+    from pathlib import Path
+    
+    parser = argparse.ArgumentParser(description='Stratify and split health data by healthCode.')
     parser.add_argument('--input_parquet', required=True,
                         help='Path to the input denormalized Parquet file.')
     parser.add_argument('--output_dir', required=True,
                         help='Directory to save the output train and test Parquet files.')
     parser.add_argument('--test_size', type=float, default=0.2,
                         help='Proportion of the dataset to include in the test split (default: 0.2).')
-    parser.add_argument('--num_bins', type=int, default=5,
-                        help='Number of bins for stratifying label counts (default: 5).')
     parser.add_argument('--random_state', type=int, default=42,
                         help='Random state for reproducibility (default: 42).')
     parser.add_argument('--demographic_parquet', 
-                        help='Path to the demographic data Parquet file for advanced stratification.')
+                        help='Path to the demographic data Parquet file for stratification.')
     parser.add_argument('--info_parquet', 
-                        help='Path to the info data Parquet file for advanced stratification.')
-    parser.add_argument('--use_advanced_split', action='store_true',
-                        help='Use advanced stratification with demographic features.')
+                        help='Path to the info data Parquet file for stratification.')
+    parser.add_argument('--split_method', type=str, choices=['basic', 'advanced', 'cluster'], default='basic',
+                        help='Stratification method to use: basic (label completeness), advanced, or cluster (default: basic).')
+    parser.add_argument('--num_bins', type=int, default=5,
+                        help='Number of bins for stratifying label counts in basic method (default: 5).')
+    parser.add_argument('--n_clusters', type=int, default=8,
+                        help='Number of clusters for cluster-based stratification (default: 8).')
+    parser.add_argument('--sharing_subset', action='store_true',
+                        help='Only include participants who opted to share with all qualified researchers.')
 
     args = parser.parse_args()
 
@@ -659,7 +706,7 @@ if __name__ == "__main__":
     print(f"Loaded dataframe shape: {df_full.shape}")
 
     # Determine which split method to use
-    if args.use_advanced_split and args.demographic_parquet and args.info_parquet:
+    if args.split_method in ['advanced', 'cluster'] and args.demographic_parquet and args.info_parquet:
         # Load demographic and info data
         demographic_path = Path(os.path.expanduser(args.demographic_parquet)).resolve()
         info_path = Path(os.path.expanduser(args.info_parquet)).resolve()
@@ -674,23 +721,36 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"Info file not found: {info_path}")
         info_df = pd.read_parquet(info_path)
         
-        # Perform advanced stratified split
-        print("Using advanced stratified split with demographic data...")
-        train_df, test_df = stratified_split_advanced(
-            dataset_df=df_full,
-            demographic_df=demographic_df,
-            info_df=info_df,
-            test_size=args.test_size,
-            random_state=args.random_state
-        )
+        if args.split_method == 'cluster':
+            # Perform cluster-based stratified split
+            print(f"Using cluster-based stratified split with n_clusters={args.n_clusters}...")
+            train_df, test_df = stratified_split_cluster(
+                dataset_df=df_full,
+                demographic_df=demographic_df,
+                info_df=info_df,
+                test_size=args.test_size,
+                n_clusters=args.n_clusters,
+                random_state=args.random_state,
+                sharing_subset=args.sharing_subset
+            )
+        else:
+            # Perform advanced stratified split
+            print("Using advanced stratified split with demographic data...")
+            train_df, test_df = stratified_split_advanced(
+                dataset_df=df_full,
+                demographic_df=demographic_df,
+                info_df=info_df,
+                test_size=args.test_size,
+                random_state=args.random_state,
+                sharing_subset=args.sharing_subset
+            )
     else:
         # Use the basic stratified split
-        if args.use_advanced_split:
-            print("Warning: Advanced split requested but demographic or info data not provided.")
+        if args.split_method in ['advanced', 'cluster']:
+            print(f"Warning: {args.split_method} split requested but demographic or info data not provided.")
             print("Falling back to basic stratified split...")
-        else:
-            print("Using basic stratified split by label completeness...")
             
+        print("Using basic stratified split by label completeness...")
         train_df, test_df = stratify_and_split_by_nan_labels(
             df_full,
             test_size=args.test_size,
@@ -712,6 +772,7 @@ if __name__ == "__main__":
     python src/train_test_splitter.py \
     --input_parquet ~/Downloads/global_records.parquet \
     --output_dir ~/Downloads/ \
+    --split_method basic \
     --test_size 0.2 \
     --num_bins 5
     
@@ -721,6 +782,17 @@ if __name__ == "__main__":
     --demographic_parquet ~/Downloads/demographic_data.parquet \
     --info_parquet ~/Downloads/info_data.parquet \
     --output_dir ~/Downloads/ \
+    --split_method advanced \
+    --test_size 0.2
+    
+    # Cluster-based stratified split:
+    python src/train_test_splitter.py \
+    --input_parquet ~/Downloads/global_records.parquet \
+    --demographic_parquet ~/Downloads/demographic_data.parquet \
+    --info_parquet ~/Downloads/info_data.parquet \
+    --output_dir ~/Downloads/ \
+    --split_method cluster \
+    --n_clusters 8 \
     --test_size 0.2 \
-    --use_advanced_split
+    --sharing_subset
     """

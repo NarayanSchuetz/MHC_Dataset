@@ -274,14 +274,16 @@ class TestGenerateWindows:
     def test_meets_coverage_criteria_min_coverage_met(self):
         """Test meets_coverage_criteria when min_channel_coverage is met."""
         day_data = pd.DataFrame({"data_coverage": [5.0, 15.0, 0.0]})
-        result = meets_coverage_criteria(day_data, min_channel_coverage=10.0)
-        assert result is True, "Should return True when min_channel_coverage is met"
+        # Sum is 20.0, so threshold of 19.0 should pass
+        result = meets_coverage_criteria(day_data, min_channel_coverage=19.0)
+        assert result is True, "Should return True when total data_coverage sum meets the minimum"
 
     def test_meets_coverage_criteria_min_coverage_not_met(self):
         """Test meets_coverage_criteria when min_channel_coverage is not met."""
         day_data = pd.DataFrame({"data_coverage": [5.0, 8.0, 0.0]})
-        result = meets_coverage_criteria(day_data, min_channel_coverage=10.0)
-        assert result is False, "Should return False when min_channel_coverage is not met"
+        # Sum is 13.0, so threshold of 14.0 should fail
+        result = meets_coverage_criteria(day_data, min_channel_coverage=14.0)
+        assert result is False, "Should return False when total data_coverage sum doesn't meet the minimum"
 
     def test_meets_coverage_criteria_min_channels_met(self):
         """Test meets_coverage_criteria when min_channels_with_data is met."""
@@ -298,20 +300,23 @@ class TestGenerateWindows:
     def test_meets_coverage_criteria_both_criteria_met(self):
         """Test meets_coverage_criteria when both criteria are met."""
         day_data = pd.DataFrame({"data_coverage": [5.0, 15.0, 0.0]})
-        result = meets_coverage_criteria(day_data, min_channel_coverage=10.0, min_channels_with_data=2)
-        assert result is True, "Should return True when both criteria are met"
+        # Sum is 20.0 and 2 channels have data
+        result = meets_coverage_criteria(day_data, min_channel_coverage=20.0, min_channels_with_data=2)
+        assert result is True, "Should return True when both total coverage and channel count criteria are met"
 
     def test_meets_coverage_criteria_one_criterion_not_met(self):
         """Test meets_coverage_criteria when one criterion is not met."""
         # Coverage criterion met, but channels criterion not met
         day_data = pd.DataFrame({"data_coverage": [15.0, 0.0, 0.0]})
-        result = meets_coverage_criteria(day_data, min_channel_coverage=10.0, min_channels_with_data=2)
-        assert result is False, "Should return False when min_channels_with_data is not met despite min_channel_coverage being met"
+        # Sum is 15.0 but only 1 channel has data
+        result = meets_coverage_criteria(day_data, min_channel_coverage=15.0, min_channels_with_data=2)
+        assert result is False, "Should return False when min_channels_with_data is not met despite total coverage being met"
         
         # Channels criterion met, but coverage criterion not met
         day_data = pd.DataFrame({"data_coverage": [5.0, 8.0, 0.0]})
-        result = meets_coverage_criteria(day_data, min_channel_coverage=10.0, min_channels_with_data=2)
-        assert result is False, "Should return False when min_channel_coverage is not met despite min_channels_with_data being met"
+        # Sum is 13.0 and 2 channels have data
+        result = meets_coverage_criteria(day_data, min_channel_coverage=15.0, min_channels_with_data=2)
+        assert result is False, "Should return False when total coverage is not met despite min_channels_with_data being met"
 
     def test_meets_coverage_criteria_empty_data(self):
         """Test meets_coverage_criteria with empty data."""
@@ -376,16 +381,18 @@ class TestGenerateWindows:
         })
         
         # Test with different criteria
-        # Case 1: Only channel coverage criterion (date1 and date3 should pass)
-        result1 = get_valid_dates(metadata_df, min_channel_coverage=10.0, min_channels_with_data=None)
-        assert sorted(result1) == sorted([date1, date3]), "Only dates 1 and 3 have channels with ≥10% coverage"
+        # Case 1: Only channel coverage criterion 
+        # date1 sum=20.0, date2 sum=7.0, date3 sum=32.0
+        result1 = get_valid_dates(metadata_df, min_channel_coverage=15.0, min_channels_with_data=None)
+        assert sorted(result1) == sorted([date1, date3]), "Only dates 1 and 3 have total coverage ≥15.0"
         
         # Case 2: Only channels with data criterion (all dates should pass with threshold 2)
         result2 = get_valid_dates(metadata_df, min_channel_coverage=None, min_channels_with_data=2)
         assert sorted(result2) == sorted([date1, date2, date3]), "All dates have at least 2 channels with data"
         
-        # Case 3: Both criteria (only date3 should pass with high thresholds)
-        result3 = get_valid_dates(metadata_df, min_channel_coverage=10.0, min_channels_with_data=2)
+        # Case 3: Both criteria
+        # date1: sum=20.0, 2 channels; date2: sum=7.0, 2 channels; date3: sum=32.0, 2 channels
+        result3 = get_valid_dates(metadata_df, min_channel_coverage=15.0, min_channels_with_data=2)
         assert sorted(result3) == sorted([date1, date3]), "Only dates 1 and 3 meet both criteria"
         
         # Case 4: No criteria (all dates should pass)

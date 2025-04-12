@@ -36,6 +36,21 @@ def test_cluster_split_real_data():
     test_size = 0.2
     random_state = 456 # Use a different random state 
     n_clusters = 8 
+    sharing_subset = True # Use sharing subset to test filtering
+    
+    # Determine eligible healthCodes based on sharing setting
+    if sharing_subset and 'sharingScope' in info_df.columns:
+        # Get healthCodes that opted to share with all qualified researchers
+        healthCodes_open_sharing = set(info_df[info_df.sharingScope == "all_qualified_researchers"].healthCode)
+        eligible_dataset_df = dataset_df[dataset_df['healthCode'].isin(healthCodes_open_sharing)].copy()
+        print(f"Filtering to {len(healthCodes_open_sharing)} healthCodes with open sharing")
+    else:
+        eligible_dataset_df = dataset_df.copy()
+        print("Using all healthCodes (no sharing filter applied)")
+    
+    # Get the set of eligible healthCodes before running the split
+    eligible_hcs = set(eligible_dataset_df['healthCode'].unique())
+    print(f"Test will use {len(eligible_hcs)} eligible healthCodes")
     
     # Run the cluster split function
     train_df, test_df = stratified_split_cluster(
@@ -44,7 +59,8 @@ def test_cluster_split_real_data():
         info_df=info_df,
         test_size=test_size,
         n_clusters=n_clusters,
-        random_state=random_state
+        random_state=random_state,
+        sharing_subset=sharing_subset
     )
     print(f"Successfully ran stratified_split_cluster with n_clusters={n_clusters} on real data.")
 
@@ -56,19 +72,18 @@ def test_cluster_split_real_data():
     assert len(train_hc.intersection(test_hc)) == 0, "Overlap detected between train/test healthCodes"
     print("Assertion Passed: No healthCode overlap.")
 
-    # 2. Check if all dataset healthCodes are present (including those without demographic data)
-    all_dataset_hcs = set(dataset_df['healthCode'].unique())
+    # 2. Check if all eligible healthCodes are present in the split
     split_hc_set = train_hc | test_hc
     
     # Check for missing healthCodes
-    missing_from_split = all_dataset_hcs - split_hc_set
-    assert len(missing_from_split) == 0, f"{len(missing_from_split)} healthCodes from dataset are missing from the split"
+    missing_from_split = eligible_hcs - split_hc_set
+    assert len(missing_from_split) == 0, f"{len(missing_from_split)} healthCodes from eligible dataset are missing from the split"
     
     # Check for extra healthCodes (shouldn't be any)
-    extra_in_split = split_hc_set - all_dataset_hcs
-    assert len(extra_in_split) == 0, f"{len(extra_in_split)} healthCodes in split are not from the dataset"
+    extra_in_split = split_hc_set - eligible_hcs
+    assert len(extra_in_split) == 0, f"{len(extra_in_split)} healthCodes in split are not from the eligible dataset"
     
-    print(f"Assertion Passed: All {len(all_dataset_hcs)} dataset healthCodes are included in the split (train: {len(train_hc)}, test: {len(test_hc)}).")
+    print(f"Assertion Passed: All {len(eligible_hcs)} eligible healthCodes are included in the split (train: {len(train_hc)}, test: {len(test_hc)}).")
     
     # Get the demographic healthCodes for comparison calculations
     demographic_df_copy = demographic_df.copy()
@@ -77,19 +92,19 @@ def test_cluster_split_real_data():
     
     # Get healthCodes with and without demographic data
     demo_hcs = set(deduped_demo['healthCode'].unique())
-    dataset_with_demo_hcs = all_dataset_hcs & demo_hcs
-    dataset_without_demo_hcs = all_dataset_hcs - demo_hcs
+    dataset_with_demo_hcs = eligible_hcs & demo_hcs
+    dataset_without_demo_hcs = eligible_hcs - demo_hcs
     
     print(f"Dataset healthCodes with demographic data: {len(dataset_with_demo_hcs)}")
     print(f"Dataset healthCodes without demographic data: {len(dataset_without_demo_hcs)}")
     
     # 3. Check split shapes (approximate)
-    expected_test_hc = int(round(len(all_dataset_hcs) * test_size))
-    expected_train_hc = len(all_dataset_hcs) - expected_test_hc
+    expected_test_hc = int(round(len(eligible_hcs) * test_size))
+    expected_train_hc = len(eligible_hcs) - expected_test_hc
     
     # Allow a small tolerance due to stratification and potential edge cases in clustering/splitting
     # Sklearn's train_test_split with stratification might slightly deviate
-    tolerance = max(2, int(len(all_dataset_hcs) * 0.02)) # Tolerance of 2 or 2%, whichever is larger
+    tolerance = max(2, int(len(eligible_hcs) * 0.02)) # Tolerance of 2 or 2%, whichever is larger
     assert abs(len(train_hc) - expected_train_hc) <= tolerance, f"Train set size deviates too much ({len(train_hc)} vs {expected_train_hc}, tolerance {tolerance})"
     assert abs(len(test_hc) - expected_test_hc) <= tolerance, f"Test set size deviates too much ({len(test_hc)} vs {expected_test_hc}, tolerance {tolerance})"
     print(f"Assertion Passed: Split shapes are approximately correct (Train: {len(train_hc)}, Test: {len(test_hc)}).")
@@ -97,7 +112,7 @@ def test_cluster_split_real_data():
     # --- 4. Detailed Distribution Comparison ---
     print("\n--- Comparing Feature Distributions ---")
     print("Note: Distribution comparisons only include healthCodes with demographic data")
-    print(f"({len(dataset_with_demo_hcs)} of {len(all_dataset_hcs)} total healthCodes, {len(dataset_without_demo_hcs)} healthCodes lack demographic data)")
+    print(f"({len(dataset_with_demo_hcs)} of {len(eligible_hcs)} total healthCodes, {len(dataset_without_demo_hcs)} healthCodes lack demographic data)")
 
     # Recalculate features needed for comparison for healthCodes with demographic data
     # This involves merging demo, info, and average label data for healthCodes with demo data
@@ -138,7 +153,7 @@ def test_cluster_split_real_data():
 
     # Calculate average label values
     label_cols = [col for col in dataset_df.columns if col.endswith('_value')]
-    avg_label_values = dataset_df[dataset_df['healthCode'].isin(dataset_with_demo_hcs)].groupby('healthCode')[label_cols].mean(numeric_only=True).reset_index()
+    avg_label_values = eligible_dataset_df.groupby('healthCode')[label_cols].mean(numeric_only=True).reset_index()
     comparison_features_df = comparison_features_df.merge(avg_label_values, on='healthCode', how='left')
 
     # --- Binning for comparison ---
@@ -232,15 +247,16 @@ def test_cluster_split_real_data():
 
     # Print the final length of train, test sets and input dataset
     print("\n--- Dataset Size Comparison ---")
-    print(f"Input dataset size: {len(dataset_df)} rows, {len(set(dataset_df['healthCode'].unique()))} unique healthCodes")
-    print(f"Train set size: {len(train_df)} rows, {len(set(train_df['healthCode'].unique()))} unique healthCodes")
-    print(f"Test set size: {len(test_df)} rows, {len(set(test_df['healthCode'].unique()))} unique healthCodes")
+    print(f"Original dataset size: {len(dataset_df)} rows, {len(dataset_df['healthCode'].unique())} unique healthCodes")
+    print(f"Eligible dataset size: {len(eligible_dataset_df)} rows, {len(eligible_hcs)} eligible healthCodes")
+    print(f"Train set size: {len(train_df)} rows, {len(train_hc)} unique healthCodes")
+    print(f"Test set size: {len(test_df)} rows, {len(test_hc)} unique healthCodes")
     
     # Calculate and print percentages
-    train_pct = len(train_df) / len(dataset_df) * 100
-    test_pct = len(test_df) / len(dataset_df) * 100
-    print(f"Train set: {train_pct:.2f}% of input dataset")
-    print(f"Test set: {test_pct:.2f}% of input dataset")
+    train_pct = len(train_df) / len(eligible_dataset_df) * 100
+    test_pct = len(test_df) / len(eligible_dataset_df) * 100
+    print(f"Train set: {train_pct:.2f}% of eligible dataset")
+    print(f"Test set: {test_pct:.2f}% of eligible dataset")
     print("\nCluster split real data integration test completed successfully.")
 
 @pytest.mark.skipif(not real_data_exists, reason="Real data files not found at specified paths")
@@ -262,6 +278,21 @@ def test_advanced_split_real_data():
         
     test_size = 0.2
     random_state = 789  # Use a different random state
+    sharing_subset = True  # Use sharing subset to test filtering
+    
+    # Determine eligible healthCodes based on sharing setting
+    if sharing_subset and 'sharingScope' in info_df.columns:
+        # Get healthCodes that opted to share with all qualified researchers
+        healthCodes_open_sharing = set(info_df[info_df.sharingScope == "all_qualified_researchers"].healthCode)
+        eligible_dataset_df = dataset_df[dataset_df['healthCode'].isin(healthCodes_open_sharing)].copy()
+        print(f"Filtering to {len(healthCodes_open_sharing)} healthCodes with open sharing")
+    else:
+        eligible_dataset_df = dataset_df.copy()
+        print("Using all healthCodes (no sharing filter applied)")
+    
+    # Get the set of eligible healthCodes before running the split
+    eligible_hcs = set(eligible_dataset_df['healthCode'].unique())
+    print(f"Test will use {len(eligible_hcs)} eligible healthCodes")
     
     # Run the advanced split function
     try:
@@ -270,7 +301,8 @@ def test_advanced_split_real_data():
             demographic_df=demographic_df,
             info_df=info_df,
             test_size=test_size,
-            random_state=random_state
+            random_state=random_state,
+            sharing_subset=sharing_subset
         )
         print(f"Successfully ran stratified_split_advanced on real data.")
     except Exception as e:
@@ -284,26 +316,25 @@ def test_advanced_split_real_data():
     assert len(train_hc.intersection(test_hc)) == 0, "Overlap detected between train/test healthCodes"
     print("Assertion Passed: No healthCode overlap.")
 
-    # 2. Check if all dataset healthCodes are present
-    all_dataset_hcs = set(dataset_df['healthCode'].unique())
+    # 2. Check if all eligible healthCodes are present in the split
     split_hc_set = train_hc | test_hc
     
     # Check for missing healthCodes
-    missing_from_split = all_dataset_hcs - split_hc_set
-    assert len(missing_from_split) == 0, f"{len(missing_from_split)} healthCodes from dataset are missing from the split"
+    missing_from_split = eligible_hcs - split_hc_set
+    assert len(missing_from_split) == 0, f"{len(missing_from_split)} healthCodes from eligible dataset are missing from the split"
     
     # Check for extra healthCodes (shouldn't be any)
-    extra_in_split = split_hc_set - all_dataset_hcs
-    assert len(extra_in_split) == 0, f"{len(extra_in_split)} healthCodes in split are not from the dataset"
+    extra_in_split = split_hc_set - eligible_hcs
+    assert len(extra_in_split) == 0, f"{len(extra_in_split)} healthCodes in split are not from the eligible dataset"
     
-    print(f"Assertion Passed: All {len(all_dataset_hcs)} dataset healthCodes are included in the split (train: {len(train_hc)}, test: {len(test_hc)}).")
+    print(f"Assertion Passed: All {len(eligible_hcs)} eligible healthCodes are included in the split (train: {len(train_hc)}, test: {len(test_hc)}).")
     
     # 3. Check split shapes (approximate)
-    expected_test_hc = int(round(len(all_dataset_hcs) * test_size))
-    expected_train_hc = len(all_dataset_hcs) - expected_test_hc
+    expected_test_hc = int(round(len(eligible_hcs) * test_size))
+    expected_train_hc = len(eligible_hcs) - expected_test_hc
     
     # Allow a small tolerance due to stratification constraints
-    tolerance = max(2, int(len(all_dataset_hcs) * 0.02)) # Tolerance of 2 or 2%, whichever is larger
+    tolerance = max(2, int(len(eligible_hcs) * 0.02)) # Tolerance of 2 or 2%, whichever is larger
     assert abs(len(train_hc) - expected_train_hc) <= tolerance, f"Train set size deviates too much ({len(train_hc)} vs {expected_train_hc}, tolerance {tolerance})"
     assert abs(len(test_hc) - expected_test_hc) <= tolerance, f"Test set size deviates too much ({len(test_hc)} vs {expected_test_hc}, tolerance {tolerance})"
     print(f"Assertion Passed: Split shapes are approximately correct (Train: {len(train_hc)}, Test: {len(test_hc)}).")
@@ -333,7 +364,7 @@ def test_advanced_split_real_data():
     print(f"Found {len(label_cols)} label columns")
     
     # Group by healthCode to get mean label values
-    avg_labels = dataset_df.groupby('healthCode')[label_cols].mean().reset_index()
+    avg_labels = eligible_dataset_df.groupby('healthCode')[label_cols].mean().reset_index()
     
     # Merge age data with average labels
     comparison_df = hc_age.merge(avg_labels, on='healthCode', how='outer')
@@ -342,6 +373,9 @@ def test_advanced_split_real_data():
     demo_cols = ['healthCode', 'BiologicalSex', 'WeightKilograms', 'HeightCentimeters']
     demo_data = demographic_df[demo_cols].drop_duplicates('healthCode')
     comparison_df = comparison_df.merge(demo_data, on='healthCode', how='outer')
+
+    # Filter to only include eligible healthCodes
+    comparison_df = comparison_df[comparison_df['healthCode'].isin(eligible_hcs)]
 
     # Split into train/test for comparison
     train_features = comparison_df[comparison_df['healthCode'].isin(train_hc)]
@@ -400,6 +434,19 @@ def test_advanced_split_real_data():
             compare_continuous_distribution(label)
         else:
             print(f"\n{label}: All values are NaN, skipping comparison")
+
+    # Print the final length of train, test sets and input dataset
+    print("\n--- Dataset Size Comparison ---")
+    print(f"Original dataset size: {len(dataset_df)} rows, {len(dataset_df['healthCode'].unique())} unique healthCodes")
+    print(f"Eligible dataset size: {len(eligible_dataset_df)} rows, {len(eligible_hcs)} eligible healthCodes")
+    print(f"Train set size: {len(train_df)} rows, {len(train_hc)} unique healthCodes")
+    print(f"Test set size: {len(test_df)} rows, {len(test_hc)} unique healthCodes")
+    
+    # Calculate and print percentages
+    train_pct = len(train_df) / len(eligible_dataset_df) * 100
+    test_pct = len(test_df) / len(eligible_dataset_df) * 100
+    print(f"Train set: {train_pct:.2f}% of eligible dataset")
+    print(f"Test set: {test_pct:.2f}% of eligible dataset")
 
     print("\nAdvanced split real data integration test completed successfully.")
 

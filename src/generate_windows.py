@@ -8,8 +8,6 @@ SHERLOCK_DATASET_PATH = "/scratch/groups/euan/mhc/mhc_dataset"
 OUTPUT_PATH = "/scratch/groups/euan/calvinxu/mhc_analysis"
 BATCH_SIZE = 500
 NUM_PROCESSES = 16
-WINDOW_SIZE = 7
-MIN_REQUIRED_DAYS = 5  # at most 2 missing days in a 7-day window
 
 
 def get_user_ids(base_path):
@@ -25,10 +23,15 @@ def load_user_metadata(base_path, user_id):
     return None
 
 
-def find_non_overlapping_7day_windows(dates):
+def find_non_overlapping_7day_windows(dates, window_size=7, min_required_days=5):
     """
     Given a sorted list of datetime objects (dates) on which the user
-    has valid data, find all non-overlapping 7-day windows with >= MIN_REQUIRED_DAYS.
+    has valid data, find all non-overlapping 7-day windows with >= min_required_days.
+
+    Args:
+        dates: List of sorted datetime objects
+        window_size: Size of the window in days
+        min_required_days: Minimum number of days required in a window
 
     Returns a list of (window_start, window_end) tuples.
     """
@@ -40,12 +43,12 @@ def find_non_overlapping_7day_windows(dates):
     last_date = dates[-1]
 
     current_start = dates[0]
-    while current_start <= last_date - timedelta(days=WINDOW_SIZE - 1):
-        window_end = current_start + timedelta(days=WINDOW_SIZE - 1)
+    while current_start <= last_date - timedelta(days=window_size - 1):
+        window_end = current_start + timedelta(days=window_size - 1)
 
         days_in_window = sum(current_start <= d <= window_end for d in dates)
 
-        if days_in_window >= MIN_REQUIRED_DAYS:
+        if days_in_window >= min_required_days:
             valid_windows.append((current_start, window_end))
             current_start = window_end + timedelta(days=1)
         else:
@@ -76,14 +79,14 @@ def meets_coverage_criteria(day_data, min_channel_coverage=None, min_channels_wi
     """
     Check if a single day's data meets the coverage criteria. This function evaluates whether
     a day's sensor data has sufficient quality based on two possible criteria:
-    1. Channel coverage percentage - checks if any channel has at least the minimum required coverage
+    1. Total data coverage - checks if the sum of data coverage percentages across all channels meets the minimum
     2. Number of channels with data - checks if enough distinct channels have any data at all
     
     The function can apply either or both criteria depending on which parameters are provided.
     
     Args:
         day_data: DataFrame containing metadata for a single day
-        min_channel_coverage: Minimum percentage coverage required per channel, if None no coverage check is applied
+        min_channel_coverage: Minimum total data coverage required across all channels, if None no coverage check is applied
         min_channels_with_data: Minimum number of channels that must have coverage > 0, if None no channel count check is applied
         
     Returns:
@@ -97,11 +100,11 @@ def meets_coverage_criteria(day_data, min_channel_coverage=None, min_channels_wi
     
     # Check coverage criteria if specified
     if min_channel_coverage is not None:
-        # Check if any channel meets the minimum coverage requirement
-        any_channel_meets_min_coverage = any(day_data['data_coverage'] >= min_channel_coverage)
+        # Check if the sum of data coverage meets the minimum threshold
+        total_coverage = day_data['data_coverage'].sum()
         
-        # If no channel meets the minimum coverage, the day doesn't meet criteria
-        if not any_channel_meets_min_coverage:
+        # If total coverage doesn't meet the minimum, the day doesn't meet criteria
+        if total_coverage < min_channel_coverage:
             return False
     
     # Check channel count criteria if specified
@@ -132,10 +135,11 @@ def get_valid_dates(metadata_df, min_channel_coverage=None, min_channels_with_da
     return sorted(valid_dates)
 
 
-def process_user(user_id, base_path, min_channel_coverage=10.0, min_channels_with_data=3):
+def process_user(user_id, base_path, min_channel_coverage=10.0, min_channels_with_data=3, 
+                window_size=7, min_required_days=5):
     """
     For a single user, find all valid 7-day windows (non-overlapping) with
-    >= MIN_REQUIRED_DAYS of data that also meet coverage criteria.
+    >= min_required_days of data that also meet coverage criteria.
     """
     metadata_df = load_user_metadata(base_path, user_id)
     if metadata_df is None or metadata_df.empty:
@@ -145,7 +149,7 @@ def process_user(user_id, base_path, min_channel_coverage=10.0, min_channels_wit
     valid_dates = get_valid_dates(metadata_df, min_channel_coverage, min_channels_with_data)
     
     # Find valid windows using filtered dates
-    valid_windows = find_non_overlapping_7day_windows(valid_dates)
+    valid_windows = find_non_overlapping_7day_windows(valid_dates, window_size, min_required_days)
     
     result_rows = []
     for start_date, end_date in valid_windows:
@@ -207,6 +211,89 @@ def run_analysis_on_sherlock():
         final_df = pd.concat(all_results, ignore_index=True)
         final_df.to_csv(final_outfile, index=False)
         print(f"\nCombined all batches into {final_outfile}")
+    else:
+        print("\nNo valid 7-day windows found across all users.")
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Generate valid 7-day windows from Sherlock dataset.')
+    parser.add_argument('--sherlock_path', type=str, required=True,
+                        help='Path to the Sherlock dataset directory')
+    parser.add_argument('--output_path', type=str, required=True,
+                        help='Directory to save the output CSV files')
+    parser.add_argument('--batch_size', type=int, default=100,
+                        help='Number of users to process in each batch (default: 100)')
+    parser.add_argument('--num_processes', type=int, default=mp.cpu_count(),
+                        help=f'Number of parallel processes to use (default: {mp.cpu_count()})')
+    parser.add_argument('--min_channel_coverage', type=float, default=10.0,
+                        help='Minimum total data coverage required across all channels (default: 10.0)')
+    parser.add_argument('--min_channels_with_data', type=int, default=3,
+                        help='Minimum number of channels that must have coverage > 0 (default: 3)')
+    parser.add_argument('--window_size', type=int, default=7,
+                        help='Size of the window in days (default: 7)')
+    parser.add_argument('--min_required_days', type=int, default=5,
+                        help='Minimum number of days with data required in a window (default: 5)')
+    
+    args = parser.parse_args()
+    
+    # Create a partial function with all the parameters
+    process_func = partial(
+        process_user, 
+        base_path=args.sherlock_path,
+        min_channel_coverage=args.min_channel_coverage,
+        min_channels_with_data=args.min_channels_with_data,
+        window_size=args.window_size,
+        min_required_days=args.min_required_days
+    )
+    
+    print(f"Searching for users in {args.sherlock_path}...")
+    user_ids = get_user_ids(args.sherlock_path)
+    total_users = len(user_ids)
+    print(f"Found {total_users} user directories.")
+
+    os.makedirs(args.output_path, exist_ok=True)
+    final_outfile = os.path.join(args.output_path, "valid_7day_windows.csv")
+
+    all_results = []
+    batch_count = (total_users - 1) // args.batch_size + 1
+
+    for batch_idx in range(batch_count):
+        start_idx = batch_idx * args.batch_size
+        end_idx = min((batch_idx + 1) * args.batch_size, total_users)
+        batch_user_ids = user_ids[start_idx:end_idx]
+
+        print(
+            f"Processing batch {batch_idx + 1}/{batch_count} "
+            f"(users {start_idx} to {end_idx - 1})..."
+        )
+
+        with mp.Pool(processes=args.num_processes) as pool:
+            batch_results = pool.map(process_func, batch_user_ids)
+
+        flattened = [row for user_rows in batch_results for row in user_rows]
+
+        if flattened:
+            batch_df = pd.DataFrame(flattened)
+            all_results.append(batch_df)
+
+            batch_file = os.path.join(
+                args.output_path, f"valid_7day_windows_batch_{batch_idx + 1}.csv"
+            )
+            batch_df.to_csv(batch_file, index=False)
+            print(f"  ... saved batch CSV to {batch_file}")
+
+        del batch_results
+
+    # Combine all batches
+    if all_results:
+        final_df = pd.concat(all_results, ignore_index=True)
+        final_df.to_csv(final_outfile, index=False)
+        print(f"\nCombined all batches into {final_outfile}")
+        print(f"Total windows found: {len(final_df)}")
     else:
         print("\nNo valid 7-day windows found across all users.")
 
