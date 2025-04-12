@@ -2,10 +2,12 @@
 
 # Configuration - modify these paths as needed
 # Dataset generation parameters
-SHERLOCK_DATASET_PATH="/path/to/your/mhc_dataset"
-OUTPUT_PATH="/path/to/your/output"
+SHERLOCK_DATASET_PATH="/scratch/users/schuetzn/data/mhc_dataset"
+OUTPUT_PATH="/scratch/users/schuetzn/data/mhc_dataset_out"
+OTHER_DATA_BASE_PATH="/home/users/schuetzn/"
+
 BATCH_SIZE=100
-NUM_PROCESSES=16
+NUM_PROCESSES=4
 
 # Data quality parameters
 MIN_CHANNEL_COVERAGE=7.638888888888889  # 25th percentile of data coverage
@@ -23,8 +25,8 @@ N_CLUSTERS=8
 # Set to "true" to only include participants who opted to share with all qualified researchers
 SHARING_SUBSET="true"
 # Only needed for advanced or cluster split methods
-DEMOGRAPHIC_PARQUET="${OUTPUT_PATH}/demographic_data.parquet"
-INFO_PARQUET="${OUTPUT_PATH}/info_data.parquet"
+DEMOGRAPHIC_PARQUET="${OTHER_DATA_BASE_PATH}/demographic_data.parquet"
+INFO_PARQUET="${OTHER_DATA_BASE_PATH}/info_data.parquet"
 
 # Print configuration
 echo "Creating dataset with the following configuration:"
@@ -43,7 +45,7 @@ mkdir -p "$OUTPUT_PATH"
 
 # Execute the Python script with the specified parameters
 echo "Step 1: Generating dataset windows..."
-python src/generate_windows.py \
+python3 ../src/generate_windows.py \
   --sherlock_path "$SHERLOCK_DATASET_PATH" \
   --output_path "$OUTPUT_PATH" \
   --batch_size "$BATCH_SIZE" \
@@ -64,7 +66,7 @@ echo "Step 2: Creating train-test splits..."
 mkdir -p "$SPLIT_OUTPUT_DIR"
 
 # Build the command based on the split method
-SPLIT_CMD="python src/train_test_splitter.py \
+SPLIT_CMD="python3 ../src/train_test_splitter.py \
   --input_parquet \"$INPUT_PARQUET\" \
   --output_dir \"$SPLIT_OUTPUT_DIR\" \
   --test_size $TEST_SIZE \
