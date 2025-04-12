@@ -4,6 +4,10 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Tuple, Optional, List, Union
 
+
+# TODO: add teacher forcing.
+
+
 class AutoencoderLSTM(nn.Module):
     """
     Autoencoder LSTM model for processing MHC dataset time series data.
@@ -269,17 +273,32 @@ class AutoencoderLSTM(nn.Module):
             labels_dict = batch['labels']
             
             for label in self.target_labels:
+                # Check if label exists and handle tensor vs scalar cases
                 if label in labels_dict:
-                    # Get ground truth and handle NaN values
-                    ground_truth = torch.tensor([
-                        labels_dict[label] if not torch.isnan(torch.tensor(labels_dict[label])) 
-                        else 0.0
-                    ], device=label_predictions[label].device)
+                    label_value = labels_dict[label]
+                    
+                    # Convert to tensor if not already
+                    if not isinstance(label_value, torch.Tensor):
+                        label_value = torch.tensor([label_value], device=label_predictions[label].device)
+                    elif label_value.dim() == 0:  # scalar tensor
+                        label_value = label_value.unsqueeze(0)
+                    
+                    # Create a mask for non-NaN values
+                    valid_mask = ~torch.isnan(label_value)
                     
                     # Only compute loss for non-NaN labels
-                    if not torch.isnan(ground_truth).any():
-                        # MSE loss for regression
-                        label_loss = F.mse_loss(label_predictions[label], ground_truth)
+                    if valid_mask.any():
+                        # Get predictions for current samples and filter out NaNs
+                        pred = label_predictions[label]
+                        
+                        # Replace NaNs with zeros for computation
+                        label_value_clean = torch.where(valid_mask, label_value, torch.zeros_like(label_value))
+                        
+                        # Compute loss only on valid entries (where the mask is True)
+                        label_loss = F.mse_loss(
+                            pred[valid_mask], 
+                            label_value_clean[valid_mask]
+                        )
                         total_loss += label_loss
                     
         return total_loss

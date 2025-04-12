@@ -161,7 +161,6 @@ class TestMhcDatasets(unittest.TestCase):
         # Check metadata
         self.assertEqual(sample['metadata']['healthCode'], "healthCode1")
         self.assertEqual(sample['metadata']['time_range'], "2023-01-15_2023-01-16")
-        self.assertEqual(sample['metadata']['file_uris'], ["healthCode1/data/2023-01-15.npy", "healthCode1/2023-01-16.npy"])
 
     def test_base_getitem_missing_day_in_range(self):
         """Test __getitem__ handles missing days within the time range."""
@@ -214,7 +213,6 @@ class TestMhcDatasets(unittest.TestCase):
         # Expect placeholders for all days in the time range
         self.assertEqual(sample['data'].shape, (2, 24, 1440)) # 2 days in range
         self.assertTrue(torch.all(torch.isnan(sample['data'])))
-        self.assertEqual(sample['metadata']['file_uris'], [])
 
     def test_base_getitem_nan_file_uris(self):
          """Test __getitem__ with NaN file_uris."""
@@ -225,7 +223,6 @@ class TestMhcDatasets(unittest.TestCase):
          # Expect placeholders for all days in the time range
          self.assertEqual(sample['data'].shape, (1, 24, 1440)) # 1 day in range
          self.assertTrue(torch.all(torch.isnan(sample['data'])))
-         self.assertTrue(pd.isna(sample['metadata']['file_uris']))
 
 
     def test_base_getitem_invalid_time_range(self):

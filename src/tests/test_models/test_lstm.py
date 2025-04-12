@@ -24,11 +24,13 @@ class TestAutoencoderLSTM:
     @pytest.fixture
     def mock_batch(self, mock_batch_data, mock_batch_mask):
         """Create a mock batch dictionary"""
+        batch_size = mock_batch_data.shape[0] # Get batch size from data
         batch = {
             'data': mock_batch_data,
             'mask': mock_batch_mask,
             'labels': {
-                'default': 0.5
+                # Create label tensor matching batch size
+                'default': torch.tensor([0.5] * batch_size) 
             }
         }
         return batch
