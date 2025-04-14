@@ -31,12 +31,14 @@ class BaseMhcDataset(Dataset):
     - Handles missing daily files within the 'time_range' by inserting a
       NaN placeholder tensor of shape (24, 1440) for data, and potentially
       a corresponding zero mask tensor if include_mask=True.
+    - If feature_stats is provided, each feature channel will be standardized
+      using the provided means and standard deviations.
 
     Output sample['data'] shape: (num_days, 24, 1440)
     Output sample['mask'] shape (if include_mask=True): (num_days, 24, 1440)
     """
 
-    def __init__(self, dataframe: pd.DataFrame, root_dir: str, include_mask: bool = False):
+    def __init__(self, dataframe: pd.DataFrame, root_dir: str, include_mask: bool = False, feature_stats: dict = None):
         """
         Args:
             dataframe (pd.DataFrame): The denormalized dataframe.
@@ -44,6 +46,9 @@ class BaseMhcDataset(Dataset):
             include_mask (bool): Whether to load and include a mask channel
                                  (from index 0 of the npy file) alongside the data.
                                  Defaults to False.
+            feature_stats (dict): Optional dictionary mapping feature indices to tuples of (mean, std)
+                                 for feature-wise standardization. If None, no standardization is applied.
+                                 Example: {0: (0.5, 1.0), 1: (0.0, 2.0)} for standardizing features 0 and 1.
         """
         super().__init__()
         if not isinstance(dataframe, pd.DataFrame):
@@ -68,10 +73,20 @@ class BaseMhcDataset(Dataset):
                  except (ValueError, SyntaxError, TypeError):
                       raise ValueError("Expected 'file_uris' column to contain lists.")
 
+        # Validate feature_stats if provided
+        if feature_stats is not None:
+            if not isinstance(feature_stats, dict):
+                raise TypeError("feature_stats must be a dictionary")
+            for idx, stats in feature_stats.items():
+                if not isinstance(stats, tuple) or len(stats) != 2:
+                    raise ValueError(f"Feature stats for index {idx} must be a tuple of (mean, std)")
+                if not all(isinstance(x, (int, float)) for x in stats):
+                    raise ValueError(f"Mean and std for feature {idx} must be numeric")
 
         self.df = dataframe.reset_index(drop=True)
         self.root_dir = Path(os.path.expanduser(root_dir))
         self.include_mask = include_mask
+        self.feature_stats = feature_stats
 
         # Identify label columns
         self.label_cols = sorted([col for col in self.df.columns if col.endswith('_value')])
@@ -80,6 +95,8 @@ class BaseMhcDataset(Dataset):
         logger.info(f"Found label columns: {self.label_cols}")
         logger.info(f"Root directory set to: {self.root_dir.resolve()}")
         logger.info(f"Include mask: {self.include_mask}") # Log mask status
+        if feature_stats:
+            logger.info(f"Feature standardization enabled for {len(feature_stats)} features")
 
     def __len__(self):
         """Returns the total number of samples in the dataset."""
@@ -190,7 +207,8 @@ class BaseMhcDataset(Dataset):
 
         Loads daily data based on 'time_range', slicing loaded files and
         inserting placeholders for missing days. Stacks daily data along axis 0.
-        Optionally includes a corresponding mask tensor.
+        Optionally includes a corresponding mask tensor. If feature_stats is provided,
+        each feature channel will be standardized using the provided means and standard deviations.
 
         Args:
             idx (int): The index of the sample to retrieve.
@@ -305,6 +323,19 @@ class BaseMhcDataset(Dataset):
         try:
             # Stack data along a new first dimension (axis=0)
             final_data_array = np.stack(daily_data, axis=0)
+            
+            # Apply feature-wise standardization if feature_stats is provided
+            if self.feature_stats is not None:
+                # Data shape is (num_days, 24, 1440)
+                # According to the file processing logic, the feature dimension is the second dimension (index 1)
+                # as we're slicing data_array[1, :, :] from the original .npy files
+                for feature_idx, (mean, std) in self.feature_stats.items():
+                    if feature_idx < 0 or feature_idx >= final_data_array.shape[1]:
+                        logger.warning(f"Feature index {feature_idx} out of bounds for data with {final_data_array.shape[1]} features. Skipping standardization for this feature.")
+                        continue
+                    # Standardize this feature across all days and time points
+                    final_data_array[:, feature_idx, :] = (final_data_array[:, feature_idx, :] - mean) / std
+            
             result_dict['data'] = torch.from_numpy(final_data_array)
 
             # Stack masks if included

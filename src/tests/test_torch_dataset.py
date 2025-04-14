@@ -248,6 +248,135 @@ class TestMhcDatasets(unittest.TestCase):
         dates_single = BaseMhcDataset._generate_date_range("2023-05-10", "2023-05-10")
         self.assertEqual(dates_single, ["2023-05-10"])
 
+    def test_base_init_feature_stats_validation(self):
+        """Test validation of feature_stats parameter."""
+        # Valid feature_stats
+        valid_stats = {0: (0.5, 1.0), 1: (0.0, 2.0)}
+        dataset = BaseMhcDataset(self.df, self.root_dir, feature_stats=valid_stats)
+        self.assertEqual(dataset.feature_stats, valid_stats)
+
+        # Invalid type for feature_stats
+        with self.assertRaisesRegex(TypeError, "feature_stats must be a dictionary"):
+            BaseMhcDataset(self.df, self.root_dir, feature_stats=[(0, (0.5, 1.0))])
+
+        # Invalid format for stats (not a tuple)
+        with self.assertRaisesRegex(ValueError, "Feature stats for index 0 must be a tuple"):
+            BaseMhcDataset(self.df, self.root_dir, feature_stats={0: [0.5, 1.0]})
+
+        # Invalid length of stats tuple
+        with self.assertRaisesRegex(ValueError, "Feature stats for index 0 must be a tuple"):
+            BaseMhcDataset(self.df, self.root_dir, feature_stats={0: (0.5, 1.0, 2.0)})
+
+        # Non-numeric values in stats
+        with self.assertRaisesRegex(ValueError, "Mean and std for feature 0 must be numeric"):
+            BaseMhcDataset(self.df, self.root_dir, feature_stats={0: ('0.5', 1.0)})
+
+    def test_feature_standardization(self):
+        """Test that feature standardization is applied correctly."""
+        # Create feature stats for standardization
+        # Applying to first two features (indices 0 and 1)
+        feature_stats = {
+            0: (0.5, 2.0),  # mean=0.5, std=2.0
+            1: (0.0, 1.0)   # mean=0.0, std=1.0
+        }
+        
+        # Initialize dataset with feature standardization
+        dataset = BaseMhcDataset(self.df, self.root_dir, feature_stats=feature_stats)
+        
+        # Get a sample that has valid data
+        sample = dataset[0]  # This should have two days of valid data
+        
+        # Extract the original (non-standardized) data for comparison
+        expected_day1 = self.day1_p1_data[1, :, :].astype(np.float32)
+        expected_day2 = self.day2_p1_data[1, :, :].astype(np.float32)
+        
+        # Manually apply standardization to expected data
+        # Feature 0
+        expected_day1[0, :] = (expected_day1[0, :] - 0.5) / 2.0
+        expected_day2[0, :] = (expected_day2[0, :] - 0.5) / 2.0
+        # Feature 1
+        expected_day1[1, :] = (expected_day1[1, :] - 0.0) / 1.0
+        expected_day2[1, :] = (expected_day2[1, :] - 0.0) / 1.0
+        
+        # Stack expected results to match output tensor shape
+        expected_data = np.stack([expected_day1, expected_day2], axis=0)
+        expected_tensor = torch.from_numpy(expected_data)
+        
+        # Compare the standardized features
+        # Feature 0 should be standardized
+        torch.testing.assert_close(sample['data'][:, 0, :], expected_tensor[:, 0, :])
+        # Feature 1 should be standardized
+        torch.testing.assert_close(sample['data'][:, 1, :], expected_tensor[:, 1, :])
+        
+        # Features 2+ should not be standardized
+        # Compare with original data slices for features not in feature_stats
+        if expected_data.shape[1] > 2:  # If we have more than 2 features
+            for feature_idx in range(2, expected_data.shape[1]):
+                original_day1 = torch.from_numpy(self.day1_p1_data[1, feature_idx, :])
+                original_day2 = torch.from_numpy(self.day2_p1_data[1, feature_idx, :])
+                torch.testing.assert_close(sample['data'][0, feature_idx, :], original_day1)
+                torch.testing.assert_close(sample['data'][1, feature_idx, :], original_day2)
+
+    def test_feature_standardization_out_of_bounds(self):
+        """Test that out-of-bounds feature indices in feature_stats are handled properly."""
+        # Set up a feature_stats with an out-of-bounds index
+        feature_stats = {
+            999: (0.5, 1.0)  # This index should be out of bounds
+        }
+        
+        # Create dataset and capture log messages
+        with self.assertLogs(level=logging.WARNING) as log:
+            dataset = BaseMhcDataset(self.df, self.root_dir, feature_stats=feature_stats)
+            sample = dataset[0]  # This should log a warning
+            
+            # Verify that a warning was logged
+            self.assertTrue(any("Feature index 999 out of bounds" in message for message in log.output))
+        
+        # Verify data was not modified (compared to non-standardized version)
+        regular_dataset = BaseMhcDataset(self.df, self.root_dir)
+        regular_sample = regular_dataset[0]
+        
+        # Data should be identical since the standardization was skipped
+        torch.testing.assert_close(sample['data'], regular_sample['data'])
+
+    def test_feature_standardization_with_mask(self):
+        """Test that feature standardization works correctly when include_mask=True."""
+        feature_stats = {
+            0: (0.5, 2.0)  # standardize just the first feature
+        }
+        
+        # Initialize dataset with both feature standardization and mask
+        dataset = BaseMhcDataset(self.df, self.root_dir, include_mask=True, feature_stats=feature_stats)
+        
+        # Get a sample
+        sample = dataset[0]
+        
+        # Verify sample has both data and mask
+        self.assertIn('data', sample)
+        self.assertIn('mask', sample)
+        
+        # Verify mask shape matches data shape
+        self.assertEqual(sample['data'].shape, sample['mask'].shape)
+        
+        # Verify standardization was applied to data but not to mask
+        # Extract original data and mask
+        expected_data_day1 = self.day1_p1_data[1, :, :].copy()
+        expected_mask_day1 = self.day1_p1_data[0, :, :].copy()
+        
+        # Apply standardization to feature 0 of expected data
+        expected_data_day1[0, :] = (expected_data_day1[0, :] - 0.5) / 2.0
+        
+        # Check feature 0 (standardized in data)
+        self.assertFalse(torch.allclose(
+            sample['data'][0, 0, :], 
+            torch.from_numpy(self.day1_p1_data[1, 0, :])
+        ))
+        
+        # Check mask (should be unchanged)
+        torch.testing.assert_close(
+            sample['mask'][0, 0, :], 
+            torch.from_numpy(self.day1_p1_data[0, 0, :])
+        )
 
     # --- Test FilteredMhcDataset ---
 
