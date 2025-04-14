@@ -15,8 +15,13 @@ MIN_CHANNELS_WITH_DATA=4
 WINDOW_SIZE=7
 MIN_REQUIRED_DAYS=5
 
+# Label dataset parameters
+LABEL_CSV="${OTHER_DATA_BASE_PATH}/combined_mhc_data.csv"
+LABELLED_JSON_OUTPUT="${OUTPUT_PATH}/labelled_dataset.json"
+LABELLED_PARQUET_OUTPUT="${OUTPUT_PATH}/labelled_dataset.parquet"
+
 # Train-test split parameters
-INPUT_PARQUET="${OUTPUT_PATH}/valid_7day_windows.csv"
+INPUT_PARQUET="${LABELLED_PARQUET_OUTPUT}"
 SPLIT_OUTPUT_DIR="${OUTPUT_PATH}/splits"
 TEST_SIZE=0.3
 RANDOM_STATE=42
@@ -45,7 +50,7 @@ mkdir -p "$OUTPUT_PATH"
 
 # Execute the Python script with the specified parameters
 echo "Step 1: Generating dataset windows..."
-python3 ../src/generate_windows.py \
+python3 src/generate_windows.py \
   --sherlock_path "$SHERLOCK_DATASET_PATH" \
   --output_path "$OUTPUT_PATH" \
   --batch_size "$BATCH_SIZE" \
@@ -61,12 +66,25 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
-echo "Step 2: Creating train-test splits..."
+echo "Step 2: Creating labelled dataset..."
+python3 src/labelled_dataset.py \
+  --interval_csv "${OUTPUT_PATH}/valid_7day_windows.csv" \
+  --label_csv "$LABEL_CSV" \
+  --json_output "$LABELLED_JSON_OUTPUT" \
+  --parquet_output "$LABELLED_PARQUET_OUTPUT"
+
+# Check if the script ran successfully
+if [ $? -ne 0 ]; then
+  echo "Error: Labelled dataset creation failed."
+  exit 1
+fi
+
+echo "Step 3: Creating train-test splits..."
 # Create splits directory
 mkdir -p "$SPLIT_OUTPUT_DIR"
 
 # Build the command based on the split method
-SPLIT_CMD="python3 ../src/train_test_splitter.py \
+SPLIT_CMD="python3 src/train_test_splitter.py \
   --input_parquet \"$INPUT_PARQUET\" \
   --output_dir \"$SPLIT_OUTPUT_DIR\" \
   --test_size $TEST_SIZE \
@@ -94,7 +112,7 @@ eval $SPLIT_CMD
 
 # Check if the script ran successfully
 if [ $? -eq 0 ]; then
-  echo "Dataset creation and splitting completed successfully!"
+  echo "Dataset creation, labelling, and splitting completed successfully!"
   echo "Output files are available at: $SPLIT_OUTPUT_DIR"
 else
   echo "Error: Train-test splitting failed."

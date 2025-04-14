@@ -8,12 +8,13 @@ from src.generate_windows import (
     find_non_overlapping_7day_windows,
     get_file_uris_for_window,
     process_user,
-    WINDOW_SIZE,
-    MIN_REQUIRED_DAYS,
     meets_coverage_criteria,
     get_valid_dates,
 )
 
+# Define constants used in tests to match the defaults in generate_windows.py
+WINDOW_SIZE = 7
+MIN_REQUIRED_DAYS = 5
 
 class TestGenerateWindows:
     def test_get_user_ids(self):
@@ -178,7 +179,7 @@ class TestGenerateWindows:
 
         mock_load_metadata.assert_called_once_with(base_path, user_id)
         mock_get_valid_dates.assert_called_once_with(mock_df, 10.0, 3)
-        mock_find_windows.assert_called_once_with([datetime(2022, 1, 1)])
+        mock_find_windows.assert_called_once_with([datetime(2022, 1, 1)], WINDOW_SIZE, MIN_REQUIRED_DAYS)
         mock_get_uris.assert_not_called()
         assert result == [], "Should return empty list when no valid windows found"
 
@@ -214,7 +215,7 @@ class TestGenerateWindows:
         user_id = "test_user"
         min_channel_coverage = 10.0
         min_channels_with_data = 3
-        
+
         result = process_user(user_id, base_path, min_channel_coverage, min_channels_with_data)
 
         expected = [{
@@ -225,9 +226,9 @@ class TestGenerateWindows:
 
         mock_load_metadata.assert_called_once_with(base_path, user_id)
         mock_get_valid_dates.assert_called_once_with(mock_df, min_channel_coverage, min_channels_with_data)
-        mock_find_windows.assert_called_once_with(valid_dates)
+        mock_find_windows.assert_called_once_with(valid_dates, WINDOW_SIZE, MIN_REQUIRED_DAYS)
         mock_get_uris.assert_called_once_with(base_path, user_id, window_start, window_end)
-        assert result == expected, "Should return expected results for valid windows"
+        assert result == expected, "Should return the expected window information"
 
     @patch("src.generate_windows.load_user_metadata")
     @patch("src.generate_windows.find_non_overlapping_7day_windows")

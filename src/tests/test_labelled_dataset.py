@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 import pytest
 from datetime import datetime
-import json
 
 from labelled_dataset import (
     _parse_string_list_safely, 
