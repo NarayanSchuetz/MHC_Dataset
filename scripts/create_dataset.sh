@@ -4,7 +4,7 @@
 # Dataset generation parameters
 SHERLOCK_DATASET_PATH="/scratch/users/schuetzn/data/mhc_dataset"
 OUTPUT_PATH="/scratch/users/schuetzn/data/mhc_dataset_out"
-OTHER_DATA_BASE_PATH="/home/users/schuetzn/"
+OTHER_DATA_BASE_PATH="/home/users/schuetzn"
 
 BATCH_SIZE=100
 NUM_PROCESSES=4
