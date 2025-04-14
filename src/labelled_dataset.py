@@ -246,7 +246,8 @@ if __name__ == "__main__":
     
     print(f"Loading label data from {label_path}")
     label_df = pd.read_csv(label_path)
-    label_df.createdOn = pd.to_datetime(label_df.createdOn, format='ISO8601')
+    # Use coerce to handle any datetime format and convert invalid dates to NaT
+    label_df.createdOn = pd.to_datetime(label_df.createdOn, errors='coerce')
 
     
     print("Processing health records...")
