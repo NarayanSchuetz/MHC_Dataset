@@ -254,6 +254,118 @@ class TestAutoencoderLSTM:
         # 3. No observed values should give close to zero loss
         assert loss_none_observed.item() < 1e-5
 
+    def test_teacher_forcing_initialization(self):
+        """Test teacher forcing ratio initialization"""
+        # Test default teacher forcing ratio
+        model_default = AutoencoderLSTM()
+        assert model_default.teacher_forcing_ratio == 0.5
+        
+        # Test custom teacher forcing ratio
+        model_custom = AutoencoderLSTM(teacher_forcing_ratio=0.7)
+        assert model_custom.teacher_forcing_ratio == 0.7
+        
+        # Test boundary values
+        model_zero = AutoencoderLSTM(teacher_forcing_ratio=0.0)
+        assert model_zero.teacher_forcing_ratio == 0.0
+        
+        model_one = AutoencoderLSTM(teacher_forcing_ratio=1.0)
+        assert model_one.teacher_forcing_ratio == 1.0
+    
+    def test_teacher_forcing_training_vs_eval(self, mock_batch):
+        """Test that teacher forcing behaves differently in training vs evaluation modes"""
+        # Create a single model instance
+        model = AutoencoderLSTM(teacher_forcing_ratio=0.0)
+        
+        # Set model to training mode
+        model.train()
+        
+        # Set fixed seed for reproducibility
+        torch.manual_seed(42)
+        
+        # Get output with teacher_forcing_ratio=0.0
+        with torch.no_grad():
+            output_train_without_tf = model(mock_batch)
+        
+        # Change teacher forcing ratio to 1.0
+        model.teacher_forcing_ratio = 1.0
+        
+        # Reset seed
+        torch.manual_seed(42)
+        
+        # Get output with teacher_forcing_ratio=1.0
+        with torch.no_grad():
+            output_train_with_tf = model(mock_batch)
+        
+        # The outputs should be different due to teacher forcing
+        assert not torch.allclose(
+            output_train_with_tf['sequence_output'], 
+            output_train_without_tf['sequence_output']
+        )
+        
+        # Now test in evaluation mode
+        model.eval()
+        
+        # First with teacher_forcing_ratio=1.0 (already set)
+        torch.manual_seed(42)
+        with torch.no_grad():
+            output_eval_with_tf = model(mock_batch)
+        
+        # Then with teacher_forcing_ratio=0.0
+        model.teacher_forcing_ratio = 0.0
+        torch.manual_seed(42)
+        with torch.no_grad():
+            output_eval_without_tf = model(mock_batch)
+        
+        # The outputs should be the same in eval mode regardless of teacher_forcing_ratio
+        # This is because teacher forcing is only applied during training
+        assert torch.allclose(
+            output_eval_with_tf['sequence_output'], 
+            output_eval_without_tf['sequence_output']
+        )
+    
+    def test_teacher_forcing_consistency(self, mock_batch):
+        """Test that outputs are consistent in eval mode regardless of teacher_forcing_ratio"""
+        # Create a single model
+        model = AutoencoderLSTM()
+        
+        # Set model to eval mode
+        model.eval()
+        
+        # Try different teacher forcing ratios with the same model
+        teacher_forcing_ratios = [0.0, 0.3, 0.5, 0.7, 1.0]
+        outputs = []
+        
+        for ratio in teacher_forcing_ratios:
+            # Update teacher forcing ratio
+            model.teacher_forcing_ratio = ratio
+            
+            # Set the same seed before each run
+            torch.manual_seed(42)
+            
+            with torch.no_grad():
+                outputs.append(model(mock_batch)['sequence_output'])
+        
+        # All outputs should be the same in eval mode
+        for i in range(1, len(outputs)):
+            assert torch.allclose(outputs[0], outputs[i])
+        
+        # Set model to train mode to test randomness in teacher forcing
+        model.train()
+        model.teacher_forcing_ratio = 0.5
+        
+        # Run with two different seeds to demonstrate randomness in teacher forcing
+        torch.manual_seed(42)
+        with torch.no_grad():
+            output_train1 = model(mock_batch)['sequence_output']
+            
+        # Use a different seed
+        torch.manual_seed(100)
+        with torch.no_grad():
+            output_train2 = model(mock_batch)['sequence_output']
+        
+        # Due to random teacher forcing, the two training runs should produce different outputs
+        assert not torch.allclose(output_train1, output_train2)
+
     def test_predict_future(self, model_without_mask):
         """Test future prediction functionality"""
         # Create a simple input sequence with proper dimensions for the model

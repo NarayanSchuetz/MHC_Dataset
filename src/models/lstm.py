@@ -5,9 +5,6 @@ import numpy as np
 from typing import Dict, Tuple, Optional, List, Union
 
 
-# TODO: add teacher forcing.
-
-
 class AutoencoderLSTM(nn.Module):
     """
     Autoencoder LSTM model for processing MHC dataset time series data.
@@ -30,6 +27,7 @@ class AutoencoderLSTM(nn.Module):
         target_labels: Optional[List[str]] = None,
         prediction_horizon: int = 1,  # Number of future 30-min segments to predict
         use_masked_loss: bool = False,  # Whether to use the mask for loss calculation
+        teacher_forcing_ratio: float = 0.5,  # Ratio of steps to use teacher forcing
     ):
         """
         Initialize the Autoencoder LSTM model.
@@ -43,6 +41,7 @@ class AutoencoderLSTM(nn.Module):
             target_labels: List of target labels to predict (without '_value' suffix)
             prediction_horizon: Number of future 30-min segments to predict
             use_masked_loss: Whether to use the binary mask to exclude missing values from loss calculation
+            teacher_forcing_ratio: Probability of using teacher forcing during training (0.0 to 1.0)
         """
         super().__init__()
         
@@ -54,6 +53,7 @@ class AutoencoderLSTM(nn.Module):
         self.target_labels = target_labels if target_labels else ["default"]
         self.prediction_horizon = prediction_horizon
         self.use_masked_loss = use_masked_loss
+        self.teacher_forcing_ratio = teacher_forcing_ratio
         
         # Constants for data structure
         self.minutes_per_segment = 30
@@ -179,15 +179,52 @@ class AutoencoderLSTM(nn.Module):
         if mask is not None:
             target_mask = mask[:, self.prediction_horizon:, :]  # Shape: (batch_size, num_segments-prediction_horizon, minutes_per_segment)
         
-        # Encode each 30-min segment to a 100d vector
-        # Process all segments in batch at once
-        encoded_segments = self.encoder(input_segments)  # Shape: (batch_size, num_segments-prediction_horizon, encoding_dim)
+        # Encode the first input segment
+        # Shape: (batch_size, 1, encoding_dim)
+        encoded_input = self.encoder(input_segments[:, 0:1, :])
         
-        # Apply LSTM to encoded sequence
-        lstm_out, (h_n, c_n) = self.lstm(encoded_segments)  # lstm_out: (batch_size, num_segments-prediction_horizon, hidden_size*num_directions)
+        # Initialize hidden and cell states
+        h, c = None, None
         
-        # Decode each output timestep back to original dimensions
-        decoded_segments = self.decoder(lstm_out)  # Shape: (batch_size, num_segments-prediction_horizon, minutes_per_segment)
+        # Storage for outputs
+        outputs = []
+        
+        # Process sequence step by step with optional teacher forcing
+        seq_len = input_segments.size(1)
+        
+        for t in range(seq_len):
+            # Pass through LSTM (with or without previous state)
+            if h is None and c is None:
+                lstm_out, (h, c) = self.lstm(encoded_input)
+            else:
+                lstm_out, (h, c) = self.lstm(encoded_input, (h, c))
+            
+            # Decode the output
+            decoded = self.decoder(lstm_out)
+            outputs.append(decoded)
+            
+            # Prepare input for next time step
+            if t < seq_len - 1:  # If not the last step
+                # Only consider teacher forcing during training
+                if self.training:
+                    # Decide whether to use teacher forcing based on ratio
+                    use_teacher_forcing = torch.rand(1).item() < self.teacher_forcing_ratio
+                    
+                    if use_teacher_forcing:
+                        # Use ground truth as next input (teacher forcing)
+                        next_input = input_segments[:, t+1:t+2, :]
+                    else:
+                        # Use own prediction as next input
+                        next_input = decoded
+                else:
+                    # In evaluation mode, always use own predictions
+                    next_input = decoded
+                
+                # Encode for next step
+                encoded_input = self.encoder(next_input)
+        
+        # Concatenate all outputs
+        decoded_segments = torch.cat(outputs, dim=1)
         
         # Prepare result dictionary
         result = {
@@ -204,11 +241,11 @@ class AutoencoderLSTM(nn.Module):
             # Use the final hidden state for label prediction
             if self.bidirectional:
                 # Combine forward and backward final hidden states
-                final_hidden = h_n.view(self.num_layers, self.num_directions, batch_size, self.hidden_size)
+                final_hidden = h.view(self.num_layers, self.num_directions, batch_size, self.hidden_size)
                 final_hidden = final_hidden[-1].transpose(0, 1).contiguous().view(batch_size, -1)
             else:
                 # Just use the final layer's hidden state
-                final_hidden = h_n[-1]
+                final_hidden = h[-1]
             
             # Generate predictions for each target label
             label_predictions = {}
