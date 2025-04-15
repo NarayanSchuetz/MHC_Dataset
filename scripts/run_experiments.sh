@@ -17,7 +17,7 @@ ml python/3.9.0
 ml py-pytorch/2.0.0_py39
 
 # Create a directory for checkpoints if it doesn't exist
-mkdir -p checkpoints
+mkdir -p /scratch/users/schuetzn/data/mhc_dataset_out/lstm
 
 # Run the LSTM experiment
 python scripts/lstm_experiment.py \
@@ -36,7 +36,7 @@ python scripts/lstm_experiment.py \
   --final_tf 0.0 \
   --decay_epochs 100 \
   --save_model \
-  --checkpoint_dir checkpoints \
+  --checkpoint_dir /scratch/users/schuetzn/data/mhc_dataset_out/lstm \
   --num_workers 20 \
   --run_name "lstm_experiment_$(date +%Y%m%d_%H%M%S)"
 

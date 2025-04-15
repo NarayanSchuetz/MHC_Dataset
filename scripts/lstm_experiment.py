@@ -217,6 +217,7 @@ def main():
     
     print(f"Training for {args.num_epochs} epochs...")
     print(f"Teacher forcing decay: {args.initial_tf*100:.0f}% -> {args.final_tf*100:.0f}% over {args.decay_epochs} epochs.")
+    print(f"Teacher forcing decay step per epoch: {tf_decay_step:.6f}")
     
     # Create checkpoint directory if needed
     if args.save_model:
@@ -225,6 +226,11 @@ def main():
     
     # Train the model
     best_val_loss = float('inf')
+    
+    # Create a figure to visualize teacher forcing decay
+    plt.figure(figsize=(12, 6))
+    tf_ratios = []
+    epochs_x = []
     
     for epoch in range(args.num_epochs):
         # Calculate and set teacher forcing ratio for this epoch
@@ -235,6 +241,13 @@ def main():
         else:
             # After decay period, keep it at the final ratio
             trainer.model.teacher_forcing_ratio = args.final_tf
+        
+        # Store teacher forcing ratio for visualization
+        tf_ratios.append(trainer.model.teacher_forcing_ratio)
+        epochs_x.append(epoch + 1)
+        
+        # Print current teacher forcing ratio for debugging
+        print(f"Epoch {epoch+1}: Teacher forcing ratio = {trainer.model.teacher_forcing_ratio:.6f}")
         
         # Train for one epoch
         train_loss = trainer.train_epoch(train_loader)
@@ -270,6 +283,16 @@ def main():
         # Visualize predictions and log to wandb (every 5 epochs)
         if (epoch + 1) % 5 == 0 or epoch == args.num_epochs - 1:
             log_sample_prediction(model, val_dataset, device)
+    
+    # Plot teacher forcing decay and log to wandb
+    plt.plot(epochs_x, tf_ratios, marker='o', linestyle='-', color='blue')
+    plt.xlabel('Epoch')
+    plt.ylabel('Teacher Forcing Ratio')
+    plt.title('Teacher Forcing Ratio Decay')
+    plt.grid(True)
+    plt.tight_layout()
+    wandb.log({"teacher_forcing_decay": wandb.Image(plt)})
+    plt.close()
     
     # Save final model checkpoint
     if args.save_model:
