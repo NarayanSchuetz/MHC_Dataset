@@ -28,6 +28,7 @@ class AutoencoderLSTM(nn.Module):
         prediction_horizon: int = 1,  # Number of future 30-min segments to predict
         use_masked_loss: bool = False,  # Whether to use the mask for loss calculation
         teacher_forcing_ratio: float = 0.5,  # Ratio of steps to use teacher forcing
+        num_features: int = 24,  # Number of features per minute (default is all 24)
     ):
         """
         Initialize the Autoencoder LSTM model.
@@ -42,6 +43,7 @@ class AutoencoderLSTM(nn.Module):
             prediction_horizon: Number of future 30-min segments to predict
             use_masked_loss: Whether to use the binary mask to exclude missing values from loss calculation
             teacher_forcing_ratio: Probability of using teacher forcing during training (0.0 to 1.0)
+            num_features: Number of features per minute (default 24, but can be reduced when using feature selection)
         """
         super().__init__()
         
@@ -54,11 +56,12 @@ class AutoencoderLSTM(nn.Module):
         self.prediction_horizon = prediction_horizon
         self.use_masked_loss = use_masked_loss
         self.teacher_forcing_ratio = teacher_forcing_ratio
+        self.num_features = num_features
         
         # Constants for data structure
         self.minutes_per_segment = 30
         self.segments_per_day = (24 * 60) // self.minutes_per_segment  # 48 segments per day
-        self.features_per_minute = 24  # 24 features per minute
+        self.features_per_minute = num_features  # Number of features per minute (can be less than 24 if using feature selection)
         self.features_per_segment = self.features_per_minute * self.minutes_per_segment  # 24*30 = 720
         
         # Encoder: Compress each 30-minute segment (with all features) to encoding_dim
