@@ -10,8 +10,8 @@ from torch.utils.data import DataLoader, random_split
 from pathlib import Path
 
 # Import the MHC dataset and LSTM model
-from src.torch_dataset import BaseMhcDataset
-from src.models.lstm import AutoencoderLSTM, LSTMTrainer
+from torch_dataset import BaseMhcDataset
+from models.lstm import AutoencoderLSTM, LSTMTrainer
 
 
 def parse_args():

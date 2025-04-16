@@ -48,36 +48,36 @@ echo ""
 # Make sure output directory exists
 mkdir -p "$OUTPUT_PATH"
 
-# # Execute the Python script with the specified parameters
-# echo "Step 1: Generating dataset windows..."
-# python3 src/generate_windows.py \
-#   --sherlock_path "$SHERLOCK_DATASET_PATH" \
-#   --output_path "$OUTPUT_PATH" \
-#   --batch_size "$BATCH_SIZE" \
-#   --num_processes "$NUM_PROCESSES" \
-#   --min_channel_coverage "$MIN_CHANNEL_COVERAGE" \
-#   --min_channels_with_data "$MIN_CHANNELS_WITH_DATA" \
-#   --window_size "$WINDOW_SIZE" \
-#   --min_required_days "$MIN_REQUIRED_DAYS"
+# Execute the Python script with the specified parameters
+echo "Step 1: Generating dataset windows..."
+python3 src/generate_windows.py \
+  --sherlock_path "$SHERLOCK_DATASET_PATH" \
+  --output_path "$OUTPUT_PATH" \
+  --batch_size "$BATCH_SIZE" \
+  --num_processes "$NUM_PROCESSES" \
+  --min_channel_coverage "$MIN_CHANNEL_COVERAGE" \
+  --min_channels_with_data "$MIN_CHANNELS_WITH_DATA" \
+  --window_size "$WINDOW_SIZE" \
+  --min_required_days "$MIN_REQUIRED_DAYS"
 
-# # Check if the script ran successfully
-# if [ $? -ne 0 ]; then
-#   echo "Error: Dataset window creation failed."
-#   exit 1
-# fi
+# Check if the script ran successfully
+if [ $? -ne 0 ]; then
+  echo "Error: Dataset window creation failed."
+  exit 1
+fi
 
-# echo "Step 2: Creating labelled dataset..."
-# python3 src/labelled_dataset.py \
-#   --interval_csv "${OUTPUT_PATH}/valid_7day_windows.csv" \
-#   --label_csv "$LABEL_CSV" \
-#   --json_output "$LABELLED_JSON_OUTPUT" \
-#   --parquet_output "$LABELLED_PARQUET_OUTPUT"
+echo "Step 2: Creating labelled dataset..."
+python3 src/labelled_dataset.py \
+  --interval_csv "${OUTPUT_PATH}/valid_7day_windows.csv" \
+  --label_csv "$LABEL_CSV" \
+  --json_output "$LABELLED_JSON_OUTPUT" \
+  --parquet_output "$LABELLED_PARQUET_OUTPUT"
 
-# # Check if the script ran successfully
-# if [ $? -ne 0 ]; then
-#   echo "Error: Labelled dataset creation failed."
-#   exit 1
-# fi
+# Check if the script ran successfully
+if [ $? -ne 0 ]; then
+  echo "Error: Labelled dataset creation failed."
+  exit 1
+fi
 
 echo "Step 3: Creating train-test splits..."
 # Create splits directory

@@ -20,7 +20,7 @@ ml py-pytorch/2.0.0_py39
 mkdir -p /scratch/users/schuetzn/data/mhc_dataset_out/lstm
 
 # Run the LSTM experiment
-python scripts/lstm_experiment.py \
+python3 scripts/lstm_experiment.py \
   --wandb_project MHC_Dataset \
   --wandb_entity schuetzn \
   --batch_size 128 \
@@ -39,4 +39,3 @@ python scripts/lstm_experiment.py \
   --checkpoint_dir /scratch/users/schuetzn/data/mhc_dataset_out/lstm \
   --num_workers 20 \
   --run_name "lstm_experiment_$(date +%Y%m%d_%H%M%S)"
-
