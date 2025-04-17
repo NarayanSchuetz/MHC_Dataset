@@ -23,7 +23,8 @@ LABELLED_PARQUET_OUTPUT="${OUTPUT_PATH}/labelled_dataset.parquet"
 # Train-test split parameters
 INPUT_PARQUET="${LABELLED_PARQUET_OUTPUT}"
 SPLIT_OUTPUT_DIR="${OUTPUT_PATH}/splits"
-TEST_SIZE=0.3
+TEST_SIZE=0.2
+VALIDATION_SIZE=0.1
 RANDOM_STATE=42
 SPLIT_METHOD="cluster"  # Options: basic, advanced, cluster
 N_CLUSTERS=8
@@ -43,6 +44,8 @@ echo "- Min channel coverage: $MIN_CHANNEL_COVERAGE"
 echo "- Min channels with data: $MIN_CHANNELS_WITH_DATA"
 echo "- Window size: $WINDOW_SIZE"
 echo "- Min required days: $MIN_REQUIRED_DAYS"
+echo "- Test size: $TEST_SIZE"
+echo "- Validation size: $VALIDATION_SIZE"
 echo ""
 
 # Make sure output directory exists
@@ -111,11 +114,74 @@ fi
 eval $SPLIT_CMD
 
 # Check if the script ran successfully
+if [ $? -ne 0 ]; then
+  echo "Error: Train-test splitting failed."
+  exit 1
+fi
+
+echo "Step 4: Creating train-validation splits..."
+# Calculate adjusted validation size as a fraction of the train set
+# If VALIDATION_SIZE=0.1 (10% of total) and TEST_SIZE=0.2 (20% of total),
+# adjusted validation size should be 0.1/0.8 = 0.125 (12.5% of train set)
+ADJUSTED_VAL_SIZE=$(echo "scale=4; $VALIDATION_SIZE / (1 - $TEST_SIZE)" | bc)
+
+# Build the command for train-validation split
+VAL_SPLIT_CMD="python3 src/train_test_splitter.py \
+  --input_parquet \"$SPLIT_OUTPUT_DIR/train_dataset.parquet\" \
+  --output_dir \"$SPLIT_OUTPUT_DIR/temp\" \
+  --test_size $ADJUSTED_VAL_SIZE \
+  --random_state $RANDOM_STATE \
+  --split_method $SPLIT_METHOD"
+
+# Add method-specific arguments
+if [ "$SPLIT_METHOD" = "basic" ]; then
+  VAL_SPLIT_CMD="$VAL_SPLIT_CMD --num_bins $NUM_BINS"
+elif [ "$SPLIT_METHOD" = "advanced" ] || [ "$SPLIT_METHOD" = "cluster" ]; then
+  VAL_SPLIT_CMD="$VAL_SPLIT_CMD --demographic_parquet \"$DEMOGRAPHIC_PARQUET\" --info_parquet \"$INFO_PARQUET\""
+  
+  if [ "$SPLIT_METHOD" = "cluster" ]; then
+    VAL_SPLIT_CMD="$VAL_SPLIT_CMD --n_clusters $N_CLUSTERS"
+  fi
+fi
+
+# Create temporary directory for train-val split
+mkdir -p "$SPLIT_OUTPUT_DIR/temp"
+
+# Execute the train-validation split command
+eval $VAL_SPLIT_CMD
+
+# Check if the script ran successfully
+if [ $? -ne 0 ]; then
+  echo "Error: Train-validation splitting failed."
+  exit 1
+fi
+
+# Move the resulting files to their final locations
+mv "$SPLIT_OUTPUT_DIR/temp/train_dataset.parquet" "$SPLIT_OUTPUT_DIR/train_final_dataset.parquet"
+mv "$SPLIT_OUTPUT_DIR/temp/test_dataset.parquet" "$SPLIT_OUTPUT_DIR/validation_dataset.parquet"
+mv "$SPLIT_OUTPUT_DIR/train_dataset.parquet" "$SPLIT_OUTPUT_DIR/train_with_val_dataset.parquet"
+rm -rf "$SPLIT_OUTPUT_DIR/temp"
+
+# Check if the script ran successfully
 if [ $? -eq 0 ]; then
   echo "Dataset creation, labelling, and splitting completed successfully!"
   echo "Output files are available at: $SPLIT_OUTPUT_DIR"
+  echo "The data was split into train, validation, and test sets with the following proportions:"
+  test_pct=$(echo "scale=1; $TEST_SIZE * 100" | bc)
+  val_pct=$(echo "scale=1; $VALIDATION_SIZE * 100" | bc)
+  train_size=$(echo "scale=1; 1 - $TEST_SIZE - $VALIDATION_SIZE" | bc)
+  train_pct=$(echo "scale=1; $train_size * 100" | bc)
+  echo "- Test set: ${TEST_SIZE} (${test_pct}% of the total dataset)"
+  echo "- Validation set: ${VALIDATION_SIZE} (${val_pct}% of the total dataset)"
+  echo "- Train set: ${train_size} (${train_pct}% of the total dataset)"
+  echo ""
+  echo "Files:"
+  echo "- test_dataset.parquet: Test set (${test_pct}% of data)"
+  echo "- validation_dataset.parquet: Validation set (${val_pct}% of data)"
+  echo "- train_final_dataset.parquet: Final train set (${train_pct}% of data)"
+  echo "- train_with_val_dataset.parquet: Combined train+val set (kept for reference)"
 else
-  echo "Error: Train-test splitting failed."
+  echo "Error: Data splitting failed."
   exit 1
 fi
 

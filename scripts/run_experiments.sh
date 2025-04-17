@@ -6,7 +6,7 @@
 #SBATCH --output=/scratch/users/schuetzn/logs/pytorch_runs/%j_lstm_experiment.log
 #SBATCH --time=12:00:00
 #SBATCH --mem=32G
-#SBATCH --cpus-per-task=20
+#SBATCH --cpus-per-task=16
 #SBATCH --mail-type=FAIL,END
 #SBATCH --mail-user=schuetzn@stanford.edu
 #SBATCH -G 1
@@ -33,9 +33,9 @@ python3 scripts/lstm_experiment.py \
   --prediction_horizon 1 \
   --num_features 6 \
   --initial_tf 1.0 \
-  --final_tf 0.0 \
-  --decay_epochs 100 \
+  --final_tf 0.3 \
+  --decay_epochs 150 \
   --save_model \
   --checkpoint_dir /scratch/users/schuetzn/data/mhc_dataset_out/lstm \
-  --num_workers 20 \
+  --num_workers 16 \
   --run_name "lstm_experiment_$(date +%Y%m%d_%H%M%S)"
