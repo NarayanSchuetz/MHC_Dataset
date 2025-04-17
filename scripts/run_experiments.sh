@@ -23,6 +23,7 @@ mkdir -p /scratch/users/schuetzn/data/mhc_dataset_out/lstm
 python3 scripts/lstm_experiment.py \
   --wandb_project MHC_Dataset \
   --wandb_entity schuetzn \
+  --use_revin \
   --batch_size 128 \
   --num_epochs 200 \
   --lr 0.0001 \
@@ -38,4 +39,4 @@ python3 scripts/lstm_experiment.py \
   --save_model \
   --checkpoint_dir /scratch/users/schuetzn/data/mhc_dataset_out/lstm \
   --num_workers 16 \
-  --run_name "lstm_experiment_$(date +%Y%m%d_%H%M%S)"
+  --run_name "revin_experiment_$(date +%Y%m%d_%H%M%S)"

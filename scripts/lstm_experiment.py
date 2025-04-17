@@ -9,9 +9,9 @@ from datetime import datetime
 from torch.utils.data import DataLoader, random_split
 from pathlib import Path
 
-# Import the MHC dataset and LSTM model
+# Import the MHC dataset and LSTM models
 from torch_dataset import BaseMhcDataset
-from models.lstm import AutoencoderLSTM, LSTMTrainer
+from models.lstm import AutoencoderLSTM, RevInAutoencoderLSTM, LSTMTrainer
 
 
 def parse_args():
@@ -54,6 +54,14 @@ def parse_args():
     parser.add_argument('--decay_epochs', type=int, default=15, 
                         help='Number of epochs to decay teacher forcing')
     
+    # RevIN parameters
+    parser.add_argument('--use_revin', action='store_true', 
+                        help='Use RevInLSTM instead of standard LSTM')
+    parser.add_argument('--revin_affine', action='store_true', 
+                        help='Use learnable affine parameters in RevIN')
+    parser.add_argument('--revin_subtract_last', action='store_true', 
+                        help='Subtract last element instead of mean in RevIN')
+    
     # Experiment tracking
     parser.add_argument('--wandb_project', type=str, default='mhc-lstm', 
                         help='WandB project name')
@@ -70,7 +78,8 @@ def parse_args():
     # Auto-generate run name if not provided
     if args.run_name is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.run_name = f"lstm_{args.num_layers}layer_h{args.hidden_size}_{timestamp}"
+        model_type = "revin" if args.use_revin else "lstm"
+        args.run_name = f"{model_type}_{args.num_layers}layer_h{args.hidden_size}_{timestamp}"
     
     return args
 
@@ -178,19 +187,39 @@ def main():
     # Set target_labels to [] if there are no labels to predict
     target_labels = []  # Can be modified to include labels if needed
     
-    model = AutoencoderLSTM(
-        num_features=args.num_features,
-        hidden_size=args.hidden_size,
-        encoding_dim=args.encoding_dim,
-        num_layers=args.num_layers,
-        dropout=args.dropout,
-        bidirectional=args.bidirectional,
-        target_labels=target_labels,
-        prediction_horizon=args.prediction_horizon,
-        use_masked_loss=True,
-        teacher_forcing_ratio=args.initial_tf
-    )
-    print(f"Initialized LSTM model with target labels: {target_labels}")
+    # Choose model type based on use_revin flag
+    if args.use_revin:
+        print("Using RevInLSTM model")
+        model = RevInAutoencoderLSTM(
+            num_features=args.num_features,
+            hidden_size=args.hidden_size,
+            encoding_dim=args.encoding_dim,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            bidirectional=args.bidirectional,
+            target_labels=target_labels,
+            prediction_horizon=args.prediction_horizon,
+            use_masked_loss=True,
+            teacher_forcing_ratio=args.initial_tf,
+            rev_in_affine=args.revin_affine,
+            rev_in_subtract_last=args.revin_subtract_last
+        )
+    else:
+        print("Using standard LSTM model")
+        model = AutoencoderLSTM(
+            num_features=args.num_features,
+            hidden_size=args.hidden_size,
+            encoding_dim=args.encoding_dim,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            bidirectional=args.bidirectional,
+            target_labels=target_labels,
+            prediction_horizon=args.prediction_horizon,
+            use_masked_loss=True,
+            teacher_forcing_ratio=args.initial_tf
+        )
+    
+    print(f"Initialized model with target labels: {target_labels}")
     
     # Calculate model parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -201,7 +230,8 @@ def main():
     # Log model architecture to wandb
     wandb.config.update({
         "total_params": total_params,
-        "trainable_params": trainable_params
+        "trainable_params": trainable_params,
+        "model_type": "RevInLSTM" if args.use_revin else "LSTM"
     })
     
     # Set up optimizer
