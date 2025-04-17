@@ -1,7 +1,7 @@
 import pytest
 import torch
 import numpy as np
-from src.models.lstm import AutoencoderLSTM
+from src.models.lstm import AutoencoderLSTM, RevInAutoencoderLSTM
 
 
 class TestAutoencoderLSTM:
@@ -521,3 +521,251 @@ if __name__ == "__main__":
     print("  Feature 0 values (first 10):", segment2[:10])
     print("  Feature 1 values (first 10):", segment2[30:40])
     print("  Feature 2 values (first 10):", segment2[60:70])
+
+
+class TestRevInAutoencoderLSTM:
+    """Test cases for RevInAutoencoderLSTM model"""
+    
+    @pytest.fixture
+    def mock_batch_data(self):
+        """Create mock batch data for testing"""
+        # Shape: batch_size=2, num_days=3, features=24, minutes=1440
+        return torch.randn(2, 3, 24, 1440)
+    
+    @pytest.fixture
+    def mock_batch_mask(self):
+        """Create mock binary mask for testing"""
+        # Shape matches mock_batch_data
+        # Create a random binary mask
+        mask = torch.randint(0, 2, (2, 3, 24, 1440)).float()
+        return mask
+    
+    @pytest.fixture
+    def mock_batch(self, mock_batch_data, mock_batch_mask):
+        """Create a mock batch dictionary"""
+        batch_size = mock_batch_data.shape[0]
+        batch = {
+            'data': mock_batch_data,
+            'mask': mock_batch_mask,
+            'labels': {
+                'default': torch.tensor([0.5] * batch_size) 
+            }
+        }
+        return batch
+    
+    @pytest.fixture
+    def model_with_mask(self):
+        """Create a RevInAutoencoderLSTM model with masked loss enabled"""
+        return RevInAutoencoderLSTM(
+            hidden_size=64,
+            encoding_dim=32,
+            num_layers=1,
+            use_masked_loss=True,
+            rev_in_affine=False,
+            rev_in_subtract_last=False
+        )
+    
+    @pytest.fixture
+    def model_with_affine(self):
+        """Create a RevInAutoencoderLSTM model with affine parameters"""
+        return RevInAutoencoderLSTM(
+            hidden_size=64,
+            encoding_dim=32,
+            num_layers=1,
+            use_masked_loss=False,
+            rev_in_affine=True,
+            rev_in_subtract_last=False
+        )
+    
+    @pytest.fixture
+    def model_with_subtract_last(self):
+        """Create a RevInAutoencoderLSTM model with subtract_last mode"""
+        return RevInAutoencoderLSTM(
+            hidden_size=64,
+            encoding_dim=32,
+            num_layers=1,
+            use_masked_loss=False,
+            rev_in_affine=False,
+            rev_in_subtract_last=True
+        )
+    
+    def test_init(self, model_with_mask, model_with_affine, model_with_subtract_last):
+        """Test model initialization with different RevIN configurations"""
+        # Test model with masked loss
+        assert model_with_mask.use_masked_loss is True
+        assert model_with_mask.hidden_size == 64
+        assert model_with_mask.encoding_dim == 32
+        assert hasattr(model_with_mask, 'rev_in')
+        assert model_with_mask.rev_in.affine is False
+        assert model_with_mask.rev_in.subtract_last is False
+        
+        # Test model with affine parameters
+        assert model_with_affine.rev_in.affine is True
+        assert hasattr(model_with_affine.rev_in, 'affine_weight')
+        assert hasattr(model_with_affine.rev_in, 'affine_bias')
+        
+        # Test model with subtract_last mode
+        assert model_with_subtract_last.rev_in.subtract_last is True
+    
+    def test_forward_pass(self, model_with_mask, mock_batch):
+        """Test forward pass with RevIN"""
+        output = model_with_mask(mock_batch)
+        
+        # Check output keys
+        assert 'sequence_output' in output
+        assert 'target_segments' in output
+        assert 'target_mask' in output  # Should have mask in output
+        assert 'label_predictions' in output
+        
+        # Check shapes based on correct preprocessing
+        batch_size = mock_batch['data'].shape[0]
+        num_days = mock_batch['data'].shape[1]
+        features = mock_batch['data'].shape[2]
+        minutes_per_day = mock_batch['data'].shape[3]
+        
+        segments_per_day = minutes_per_day // model_with_mask.minutes_per_segment
+        num_segments = num_days * segments_per_day
+        output_features = features * model_with_mask.minutes_per_segment
+        
+        # Output has shape (batch_size, num_segments - prediction_horizon, output_features)
+        expected_output_shape = (batch_size, num_segments - model_with_mask.prediction_horizon, output_features)
+        assert output['sequence_output'].shape == expected_output_shape
+        assert output['target_segments'].shape == expected_output_shape
+        assert output['target_mask'].shape == expected_output_shape
+        assert output['label_predictions']['default'].shape == (batch_size,)
+    
+    def test_compute_loss(self, model_with_mask, mock_batch):
+        """Test loss computation with RevIN"""
+        output = model_with_mask(mock_batch)
+        loss = model_with_mask.compute_loss(output, mock_batch)
+        
+        # Check loss is scalar tensor
+        assert isinstance(loss, torch.Tensor)
+        assert loss.ndim == 0
+        assert loss.item() > 0  # Loss should be positive for random data
+    
+    def test_predict_future(self, model_with_mask):
+        """Test future prediction with RevIN"""
+        # Create input sequence
+        batch_size = 2
+        num_segments = 10
+        output_features = 24 * 30
+        input_sequence = torch.randn(batch_size, num_segments, output_features)
+        
+        # Predict 3 steps into future
+        steps = 3
+        future = model_with_mask.predict_future(input_sequence, steps)
+        
+        # Check shape is correct
+        assert future.shape == (batch_size, steps, output_features)
+        
+        # Ensure predictions are deterministic in eval mode
+        model_with_mask.eval()
+        future1 = model_with_mask.predict_future(input_sequence, steps)
+        future2 = model_with_mask.predict_future(input_sequence, steps)
+        assert torch.allclose(future1, future2)
+    
+    def test_revin_normalization(self, model_with_mask, mock_batch_data):
+        """Test that RevIN normalization has expected effects on data"""
+        model = model_with_mask
+        
+        # Preprocess data
+        x = model.preprocess_batch(mock_batch_data)
+        
+        # Apply normalization directly through the RevIN module
+        x_norm = model.rev_in(x, mode='norm')
+        
+        # Check that shape remains the same
+        assert x_norm.shape == x.shape
+        
+        # Apply denormalization to verify round-trip
+        x_denorm = model.rev_in(x_norm, mode='denorm')
+        
+        # Check that denormalization recovers the original data
+        assert torch.allclose(x, x_denorm, rtol=1e-4, atol=1e-4)
+    
+    def test_revin_vs_standard_model(self, mock_batch):
+        """Test that RevIN and standard autoencoder models produce different outputs"""
+        # Create models with the same parameters except for RevIN
+        revin_model = RevInAutoencoderLSTM(
+            hidden_size=64,
+            encoding_dim=32,
+            num_layers=1,
+            use_masked_loss=False
+        )
+        
+        standard_model = AutoencoderLSTM(
+            hidden_size=64,
+            encoding_dim=32,
+            num_layers=1,
+            use_masked_loss=False
+        )
+        
+        # Set models to eval mode for deterministic output
+        revin_model.eval()
+        standard_model.eval()
+        
+        # Forward pass through both models
+        with torch.no_grad():
+            revin_output = revin_model(mock_batch)
+            standard_output = standard_model(mock_batch)
+        
+        # The outputs should be different due to RevIN normalization
+        # We don't expect them to be extremely different, just not identical
+        assert not torch.allclose(
+            revin_output['sequence_output'], 
+            standard_output['sequence_output'],
+            rtol=1e-2, atol=1e-2
+        )
+
+
+# Add RevIN visualization to the existing script
+if __name__ == "__main__":
+    print("\n=== SEQUENTIAL DATA PREPROCESSING VISUALIZATION ===\n")
+    
+    # Original code for preprocessing visualization...
+    
+    print("\n=== RevIN NORMALIZATION VISUALIZATION ===\n")
+    
+    # Create a RevIN model
+    revin_model = RevInAutoencoderLSTM(
+        hidden_size=64,
+        encoding_dim=32,
+        num_layers=1,
+        use_masked_loss=False
+    )
+    
+    # Create a simple tensor with consistent mean and std 
+    batch_size = 1
+    num_segments = 5
+    features_per_segment = 24 * 30
+    
+    # Random tensor with specific mean and std
+    mean_value = 10.0
+    std_value = 5.0
+    x = torch.randn(batch_size, num_segments, features_per_segment) * std_value + mean_value
+    
+    # Display original statistics
+    original_mean = torch.mean(x).item()
+    original_std = torch.std(x).item()
+    print(f"Original tensor - Mean: {original_mean:.4f}, Std: {original_std:.4f}")
+    
+    # Apply RevIN normalization
+    x_norm = revin_model.rev_in(x, mode='norm')
+    
+    # Display normalized statistics
+    norm_mean = torch.mean(x_norm).item()
+    norm_std = torch.std(x_norm).item()
+    print(f"Normalized tensor - Mean: {norm_mean:.4f}, Std: {norm_std:.4f}")
+    
+    # Apply RevIN denormalization
+    x_denorm = revin_model.rev_in(x_norm, mode='denorm')
+    
+    # Display denormalized statistics
+    denorm_mean = torch.mean(x_denorm).item()
+    denorm_std = torch.std(x_denorm).item()
+    print(f"Denormalized tensor - Mean: {denorm_mean:.4f}, Std: {denorm_std:.4f}")
+    
+    # Verify original and denormalized tensors are close
+    diff = torch.abs(x - x_denorm).max().item()
+    print(f"Maximum absolute difference after roundtrip: {diff:.8f}")
