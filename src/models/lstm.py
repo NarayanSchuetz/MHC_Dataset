@@ -723,3 +723,160 @@ class LSTMTrainer:
                 total_loss += loss.item()
                 
         return total_loss / len(dataloader)
+
+def load_checkpoint(
+    checkpoint_path: str, 
+    device: torch.device = torch.device('cpu'),
+    model_type: str = 'lstm',
+    verbose: bool = True
+) -> Tuple[Union[AutoencoderLSTM, RevInAutoencoderLSTM], Dict]:
+    """
+    Load a model checkpoint saved during training.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        device: Device to load the model on ('cpu' or 'cuda')
+        model_type: Type of model to load ('lstm' or 'revin')
+        verbose: Whether to print status messages
+        
+    Returns:
+        Tuple of (loaded_model, checkpoint_data)
+        where checkpoint_data contains additional information like epoch, losses, etc.
+    """
+    if verbose:
+        print(f"Loading checkpoint from {checkpoint_path}")
+    
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Extract model parameters from state dict
+    state_dict = checkpoint['model_state_dict']
+    
+    # Analyze state_dict to determine model parameters
+    # This is necessary because we need to initialize the model with the same parameters
+    # that were used to create the saved model
+    
+    # Get needed parameters for model reconstruction
+    # We can determine hidden_size from one of the lstm weight matrices
+    hidden_size = None
+    encoding_dim = None
+    num_layers = None
+    bidirectional = False
+    num_features = None
+    
+    for key, value in state_dict.items():
+        if 'lstm.weight_ih_l0' in key:
+            # Get encoding_dim from the input weights
+            encoding_dim = value.shape[1]
+        elif 'lstm.weight_hh_l0' in key:
+            # Get hidden_size from the hidden weights
+            hidden_size = value.shape[1]
+        elif 'encoder.0.weight' in key:
+            # Get features_per_segment from encoder input size
+            num_features = value.shape[1] // 30  # dividing by minutes_per_segment (30)
+        
+        # Check if bidirectional
+        if 'lstm.weight_ih_l0_reverse' in key:
+            bidirectional = True
+    
+    # Count the number of layers by looking for distinct layer indices in state dict
+    layer_indices = set()
+    for key in state_dict.keys():
+        if 'lstm.weight_ih_l' in key:
+            # Extract the layer number after 'l'
+            idx = key.split('_l')[1].split('_')[0]
+            if idx.isdigit():  # Ensure it's a number
+                layer_indices.add(int(idx))
+    
+    num_layers = len(layer_indices)
+    
+    if verbose:
+        print(f"Detected model parameters:")
+        print(f"  hidden_size: {hidden_size}")
+        print(f"  encoding_dim: {encoding_dim}")
+        print(f"  num_layers: {num_layers}")
+        print(f"  bidirectional: {bidirectional}")
+        print(f"  num_features: {num_features}")
+    
+    # Check if the model uses RevIN by looking for rev_in parameters
+    has_revin = any('rev_in' in key for key in state_dict.keys())
+    
+    # Override model_type based on what we found if needed
+    if has_revin and model_type != 'revin':
+        if verbose:
+            print(f"Detected RevIN parameters in checkpoint, changing model_type to 'revin'")
+        model_type = 'revin'
+    elif not has_revin and model_type == 'revin':
+        if verbose:
+            print(f"No RevIN parameters found, changing model_type to 'lstm'")
+        model_type = 'lstm'
+    
+    # Extract target labels from output layers
+    target_labels = []
+    for key in state_dict.keys():
+        if 'output_layers.' in key:
+            # Extract the label name between output_layers. and .weight
+            label = key.split('output_layers.')[1].split('.')[0]
+            if label not in target_labels:
+                target_labels.append(label)
+    
+    # Remove 'default' if there are other labels (as 'default' is added when no labels are provided)
+    if len(target_labels) > 1 and 'default' in target_labels:
+        target_labels.remove('default')
+        
+    if verbose:
+        print(f"  target_labels: {target_labels}")
+    
+    # Initialize model with extracted parameters
+    if model_type == 'revin':
+        # Check for RevIN specific parameters from the keys
+        rev_in_affine = any('rev_in.affine' in key for key in state_dict.keys())
+        rev_in_subtract_last = False  # This is harder to determine from state_dict alone
+        
+        model = RevInAutoencoderLSTM(
+            hidden_size=hidden_size,
+            encoding_dim=encoding_dim,
+            num_layers=num_layers,
+            dropout=0.0,  # Default, will be overridden by loaded weights
+            bidirectional=bidirectional,
+            target_labels=target_labels,
+            num_features=num_features,
+            rev_in_affine=rev_in_affine,
+            rev_in_subtract_last=rev_in_subtract_last
+        )
+    else:
+        model = AutoencoderLSTM(
+            hidden_size=hidden_size,
+            encoding_dim=encoding_dim,
+            num_layers=num_layers,
+            dropout=0.0,  # Default, will be overridden by loaded weights
+            bidirectional=bidirectional,
+            target_labels=target_labels,
+            num_features=num_features
+        )
+    
+    # Load the state dictionary
+    try:
+        model.load_state_dict(state_dict)
+        if verbose:
+            print("Successfully loaded model weights")
+    except Exception as e:
+        print(f"Error loading model weights: {e}")
+        # Try a partial load if full load fails
+        try:
+            model.load_state_dict(state_dict, strict=False)
+            print("Partial weight loading successful")
+        except Exception as e2:
+            print(f"Partial loading also failed: {e2}")
+    
+    # Move model to device
+    model = model.to(device)
+    
+    # Set model to evaluation mode
+    model.eval()
+    
+    if verbose:
+        print(f"Model loaded and ready on {device}")
+    
+    # Return model and checkpoint data (which includes optimizer state, epoch, losses)
+    return model, checkpoint

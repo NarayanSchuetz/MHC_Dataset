@@ -19,7 +19,7 @@ def parse_args():
     
     # Data paths
     parser.add_argument('--dataset_path', type=str, 
-                        default="/scratch/users/schuetzn/data/mhc_dataset_out/splits/train_dataset.parquet",
+                        default="/scratch/users/schuetzn/data/mhc_dataset_out/splits/train_with_val_dataset.parquet",
                         help='Path to the dataset parquet file')
     parser.add_argument('--root_dir', type=str, 
                         default="/scratch/groups/euan/mhc/mhc_dataset",
