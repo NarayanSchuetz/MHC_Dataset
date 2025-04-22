@@ -355,7 +355,8 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
         teacher_forcing_ratio: float = 0.5,
         num_features: int = 24, # This is num_original_features
         rev_in_affine: bool = False,
-        rev_in_subtract_last: bool = False
+        rev_in_subtract_last: bool = False,
+        rev_in_eps: float = 1e-5
     ):
         """
         Initialize the RevIN Time Series Autoencoder LSTM model.
@@ -382,63 +383,75 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
         # Instantiate RevIN layer - operates on the original features dimension
         # It expects input shape (batch, seq_len, features)
         # We will reshape data to (batch, time_steps, num_original_features)
+        self.rev_in_eps = rev_in_eps
+        
         self.rev_in = RevIN(
             num_features=self.num_original_features, # Use original feature count
             affine=rev_in_affine,
-            subtract_last=rev_in_subtract_last
+            subtract_last=rev_in_subtract_last,
+            eps=self.rev_in_eps
         )
 
     def forward(self, batch: Dict[str, Union[torch.Tensor, Dict]], return_predictions: bool = True) -> Dict[str, torch.Tensor]:
         """
-        Forward pass through the RevIN Time Series Autoencoder LSTM model.
-        Applies RevIN normalization to original features before segmentation,
-        and de-normalization after decoding.
+        Forward pass with conditional RevIN based on feature variance.
         """
-        x_orig = batch['data']  # Shape: (B, D, F, M) = (batch_size, num_days, num_original_features, minutes_per_day)
+        x_orig = batch['data']
         mask_orig = batch.get('mask') if self.use_masked_loss else None
-
         batch_size, num_days, _, minutes_per_day = x_orig.shape
         time_steps = num_days * minutes_per_day
 
-        # --- RevIN Normalization ---
-        # Reshape for RevIN: (B, D, F, M) -> (B, F, D*M) -> (B, D*M, F)
+        # --- Reshape and Clean Input ---
+        # Reshape: (B, D, F, M) -> (B, T, F)
         x_reshaped = x_orig.permute(0, 2, 1, 3).reshape(batch_size, self.num_original_features, time_steps)
-        x_reshaped = x_reshaped.permute(0, 2, 1) # Shape: (B, time_steps, F)
+        x_reshaped = x_reshaped.permute(0, 2, 1)
 
-        # Apply RevIN normalization
-        x_normalized_reshaped = self.rev_in(x_reshaped, mode='norm')
+        # Handle NaNs before variance check
+        x_clean = torch.nan_to_num(x_reshaped, nan=0.0)
 
-        # Reshape back to original format: (B, time_steps, F) -> (B, F, time_steps) -> (B, D, F, M)
-        x_normalized = x_normalized_reshaped.permute(0, 2, 1).reshape(batch_size, self.num_original_features, num_days, minutes_per_day)
-        x_normalized = x_normalized.permute(0, 2, 1, 3) # Shape: (B, D, F, M)
-        # --- End RevIN Normalization ---
+        # --- Detect Zero-Variance Features ---
+        # Calculate std dev along time dim (T) for each feature (F) in each batch (B)
+        stdev = torch.std(x_clean, dim=1, keepdim=True) # Shape: (B, 1, F)
+        # Mask for features with variance < eps (True means skip RevIN)
+        skip_revin_mask = (stdev < self.rev_in_eps) # Shape: (B, 1, F)
+
+        # --- Conditional RevIN Normalization ---
+        # Apply RevIN normalization (will calculate stats internally)
+        # The RevIN layer itself should handle the eps for division safety
+        x_normalized_all = self.rev_in(x_clean, mode='norm')
+
+        # Keep original (cleaned) values for zero-variance features
+        # Use the mask to select between original cleaned data and normalized data
+        x_normalized_final = torch.where(skip_revin_mask, x_clean, x_normalized_all)
+
+        # Reshape back to (B, D, F, M)
+        x_normalized = x_normalized_final.permute(0, 2, 1).reshape(batch_size, self.num_original_features, num_days, minutes_per_day)
+        x_normalized = x_normalized.permute(0, 2, 1, 3)
+        # --- End Conditional Normalization ---
 
         # Preprocess normalized data (and original mask) into segments
-        # Mask remains associated with original structure, not normalized values
         if mask_orig is not None:
             x_norm_segmented, mask_segmented = self.preprocess_batch(x_normalized, mask_orig)
         else:
             x_norm_segmented = self.preprocess_batch(x_normalized)
             mask_segmented = None
 
-        # Preprocess original data (without mask needed here) to get targets in original scale
-        x_orig_segmented = self.preprocess_batch(x_orig)
+        # Preprocess original data for targets (handle NaNs)
+        x_orig_processed = torch.nan_to_num(x_orig, nan=0.0)
+        x_orig_segmented = self.preprocess_batch(x_orig_processed)
 
         # Split segments
-        # Input for LSTM is normalized
         input_segments_norm = x_norm_segmented[:, :-self.prediction_horizon, :]
-        # Target for loss is original scale
         target_segments_orig = x_orig_segmented[:, self.prediction_horizon:, :]
-
         target_mask = None
         if mask_segmented is not None:
-            target_mask = mask_segmented[:, self.prediction_horizon:, :] # Mask corresponds to original structure
+            target_mask = mask_segmented[:, self.prediction_horizon:, :]
 
-        # --- LSTM Autoencoder Logic (operates on normalized data) ---
-        encoded_input = self.encoder(input_segments_norm[:, 0:1, :]) # Encode first normalized segment
+        # --- LSTM Autoencoder Logic (operates on conditionally normalized data) ---
+        encoded_input = self.encoder(input_segments_norm[:, 0:1, :])
         h, c = None, None
-        outputs_normalized = [] # Store normalized decoder outputs
-        seq_len = input_segments_norm.size(1) # Length of sequence to process
+        outputs_conditionally_normalized = []
+        seq_len = input_segments_norm.size(1)
 
         for t in range(seq_len):
             if h is None and c is None:
@@ -446,62 +459,64 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
             else:
                 lstm_out, (h, c) = self.lstm(encoded_input, (h, c))
 
-            decoded_normalized = self.decoder(lstm_out) # Still normalized
-            outputs_normalized.append(decoded_normalized)
+            decoded_cond_norm = self.decoder(lstm_out) # Output is conditionally normalized
+            outputs_conditionally_normalized.append(decoded_cond_norm)
 
             if t < seq_len - 1:
                 use_teacher_forcing = self.training and (torch.rand(1).item() < self.teacher_forcing_ratio)
                 if use_teacher_forcing:
-                    next_input_normalized = input_segments_norm[:, t+1:t+2, :] # Ground truth (normalized)
+                    next_input_cond_norm = input_segments_norm[:, t+1:t+2, :]
                 else:
-                    next_input_normalized = decoded_normalized # Model's own prediction (normalized)
-                encoded_input = self.encoder(next_input_normalized) # Encode for next step
+                    next_input_cond_norm = decoded_cond_norm
+                encoded_input = self.encoder(next_input_cond_norm)
         # --- End LSTM Autoencoder Logic ---
 
-        # Concatenate normalized predictions
-        # Shape: (B, seq_len, features_per_segment)
-        decoded_segments_normalized = torch.cat(outputs_normalized, dim=1)
+        # Concatenate predictions (still conditionally normalized)
+        decoded_segments_cond_norm = torch.cat(outputs_conditionally_normalized, dim=1) # (B, seq_len, F_seg)
 
-        # --- RevIN De-normalization ---
-        # Reshape normalized decoded segments back into time series format
-        # (B, seq_len, F*MinPerSeg) -> (B, seq_len*MinPerSeg, F)
-        num_predicted_segments = decoded_segments_normalized.shape[1]
+        # --- Conditional RevIN De-normalization ---
+        # Reshape predictions back into time series format: (B, seq_len, F*MinPerSeg) -> (B, pred_T, F)
+        num_predicted_segments = decoded_segments_cond_norm.shape[1]
         predicted_time_steps = num_predicted_segments * self.minutes_per_segment
+        decoded_cond_norm_reshaped = decoded_segments_cond_norm.view(batch_size, num_predicted_segments, self.num_original_features, self.minutes_per_segment)
+        decoded_cond_norm_reshaped = decoded_cond_norm_reshaped.permute(0, 1, 3, 2)
+        decoded_cond_norm_reshaped = decoded_cond_norm_reshaped.reshape(batch_size, predicted_time_steps, self.num_original_features) # (B, pred_T, F)
 
-        decoded_norm_reshaped = decoded_segments_normalized.view(batch_size, num_predicted_segments, self.num_original_features, self.minutes_per_segment)
-        decoded_norm_reshaped = decoded_norm_reshaped.permute(0, 1, 3, 2) # -> (B, seq_len, MinPerSeg, F)
-        decoded_norm_reshaped = decoded_norm_reshaped.reshape(batch_size, predicted_time_steps, self.num_original_features) # -> (B, predicted_time_steps, F)
+        # Apply RevIN de-normalization (using stored stats)
+        # This will attempt to de-normalize all features based on stored stats
+        decoded_denorm_all = self.rev_in(decoded_cond_norm_reshaped, mode='denorm')
 
-        # Apply RevIN de-normalization
-        # Important: Need to pass the reshaped *normalized* data corresponding to the prediction window
-        # We use the statistics stored from the *full* input sequence normalization.
-        # RevIN's denorm uses the stored mean/std, not recalculating.
-        decoded_denorm_reshaped = self.rev_in(decoded_norm_reshaped, mode='denorm')
+        # Keep the non-de-normalized (i.e., the direct output from LSTM) values
+        # for features that were originally skipped.
+        # Expand skip_revin_mask to match prediction time steps: (B, 1, F) -> (B, pred_T, F)
+        skip_revin_mask_expanded = skip_revin_mask.expand(-1, predicted_time_steps, -1)
+        decoded_denorm_final = torch.where(
+            skip_revin_mask_expanded,
+            decoded_cond_norm_reshaped, # Use the non-denormalized value if RevIN was skipped
+            decoded_denorm_all          # Use the de-normalized value if RevIN was applied
+        )
 
         # Reshape de-normalized time series back into segments
-        # (B, predicted_time_steps, F) -> (B, seq_len, F*MinPerSeg)
-        decoded_denorm_segments = decoded_denorm_reshaped.view(batch_size, num_predicted_segments, self.minutes_per_segment, self.num_original_features)
-        decoded_denorm_segments = decoded_denorm_segments.permute(0, 1, 3, 2) # -> (B, seq_len, F, MinPerSeg)
-        decoded_denorm_segments = decoded_denorm_segments.reshape(batch_size, num_predicted_segments, self.features_per_segment) # -> (B, seq_len, features_per_segment)
-        # --- End RevIN De-normalization ---
-
+        decoded_denorm_segments = decoded_denorm_final.view(batch_size, num_predicted_segments, self.minutes_per_segment, self.num_original_features)
+        decoded_denorm_segments = decoded_denorm_segments.permute(0, 1, 3, 2)
+        decoded_denorm_segments = decoded_denorm_segments.reshape(batch_size, num_predicted_segments, self.features_per_segment)
+        # --- End Conditional De-normalization ---
 
         # Prepare result dictionary
         result = {
-            'sequence_output': decoded_denorm_segments, # De-normalized output
-            'target_segments': target_segments_orig,  # Original scale target
+            'sequence_output': decoded_denorm_segments, # Final output in original scale
+            'target_segments': target_segments_orig,    # Target in original scale
         }
         if self.use_masked_loss and target_mask is not None:
-            result['target_mask'] = target_mask # Use original mask
+            result['target_mask'] = target_mask
 
-        # Add label predictions if requested (based on final LSTM hidden state from normalized data)
+        # Add label predictions
         if return_predictions:
             if self.bidirectional:
                 final_hidden = h.view(self.num_layers, self.num_directions, batch_size, self.hidden_size)[-1]
                 final_hidden = final_hidden.transpose(0, 1).contiguous().view(batch_size, -1)
             else:
                 final_hidden = h[-1]
-
             label_predictions = {}
             for label in self.target_labels:
                 label_predictions[label] = self.output_layers[label](final_hidden).squeeze(-1)
@@ -509,22 +524,21 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
 
         return result
 
-    # compute_loss remains the same as it operates on the de-normalized sequence_output
-    # and the original scale target_segments.
+    # compute_loss remains the same
 
+    # predict_future would need similar conditional logic:
+    # 1. Reshape input segments -> time series
+    # 2. Clean NaNs
+    # 3. Calculate std dev and skip_revin_mask
+    # 4. Apply RevIN norm conditionally -> normalized_input_final
+    # 5. Reshape normalized_input_final -> segments for LSTM
+    # 6. Run prediction loop in conditionally normalized space
+    # 7. Reshape predictions -> time series (conditionally normalized)
+    # 8. Apply RevIN de-norm conditionally using the *original* skip_revin_mask -> final denormalized predictions
+    # 9. Reshape back to segments
     def predict_future(self, input_sequence: torch.Tensor, steps: int = 1) -> torch.Tensor:
         """
-        Predict future time steps using RevIN applied to original features.
-        Normalizes input, predicts in normalized space using segmented LSTM,
-        and de-normalizes the final prediction.
-
-        Args:
-            input_sequence: Input tensor of shape (batch_size, num_segments, features_per_segment).
-                            Assumes this is already preprocessed (segmented) *in original scale*.
-            steps: Number of future 30-min segments to predict
-
-        Returns:
-            Tensor of shape (batch_size, steps, features_per_segment) with de-normalized predictions
+        Predict future time steps with conditional RevIN based on input feature variance.
         """
         self.eval()
         batch_size = input_sequence.shape[0]
@@ -532,69 +546,62 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
         input_time_steps = num_input_segments * self.minutes_per_segment
 
         with torch.no_grad():
-            # --- RevIN Normalization ---
-            # Reshape input segments back to time series format: (B, num_seg, F*MinPerSeg) -> (B, num_seg*MinPerSeg, F)
+            # --- Reshape, Clean, Detect Variance ---
             input_reshaped = input_sequence.view(batch_size, num_input_segments, self.num_original_features, self.minutes_per_segment)
-            input_reshaped = input_reshaped.permute(0, 1, 3, 2) # -> (B, num_seg, MinPerSeg, F)
-            input_reshaped = input_reshaped.reshape(batch_size, input_time_steps, self.num_original_features) # -> (B, input_time_steps, F)
+            input_reshaped = input_reshaped.permute(0, 1, 3, 2).reshape(batch_size, input_time_steps, self.num_original_features)
+            input_clean = torch.nan_to_num(input_reshaped, nan=0.0)
+            stdev = torch.std(input_clean, dim=1, keepdim=True)
+            skip_revin_mask = (stdev < self.rev_in_eps) # Shape: (B, 1, F) - Crucial mask for later
 
-            # Apply RevIN normalization
-            normalized_input_reshaped = self.rev_in(input_reshaped, mode='norm')
+            # --- Conditional Normalization ---
+            normalized_input_all = self.rev_in(input_clean, mode='norm')
+            normalized_input_final = torch.where(skip_revin_mask, input_clean, normalized_input_all)
 
-            # Reshape normalized time series back into segments for LSTM processing
-            # (B, input_time_steps, F) -> (B, num_seg, features_per_segment)
-            normalized_input_segmented = normalized_input_reshaped.view(batch_size, num_input_segments, self.minutes_per_segment, self.num_original_features)
-            normalized_input_segmented = normalized_input_segmented.permute(0, 1, 3, 2) # -> (B, num_seg, F, MinPerSeg)
-            normalized_input_segmented = normalized_input_segmented.reshape(batch_size, num_input_segments, self.features_per_segment) # -> (B, num_seg, features_per_segment)
-            # --- End RevIN Normalization ---
+            # Reshape normalized time series back into segments for LSTM
+            normalized_input_segmented = normalized_input_final.view(batch_size, num_input_segments, self.minutes_per_segment, self.num_original_features)
+            normalized_input_segmented = normalized_input_segmented.permute(0, 1, 3, 2).reshape(batch_size, num_input_segments, self.features_per_segment)
+            # --- End Conditional Normalization ---
 
-            # --- Prediction Loop (operates on normalized segments) ---
-            future_predictions_normalized = []
-            current_normalized_input = normalized_input_segmented # Start with the normalized input history
+            # --- Prediction Loop (operates on conditionally normalized segments) ---
+            future_predictions_cond_norm = []
+            current_cond_norm_input = normalized_input_segmented # Start with the normalized input history
             h, c = None, None
-
-            # Process the initial normalized history to get starting hidden state
-            encoded_norm_hist = self.encoder(current_normalized_input)
-            _, (h, c) = self.lstm(encoded_norm_hist) # Get final state
-
-            # Use the last segment of the normalized history as the first input for prediction loop
-            last_normalized_segment = current_normalized_input[:, -1:, :] # Shape: (B, 1, features_per_segment)
+            encoded_cond_norm_hist = self.encoder(current_cond_norm_input)
+            _, (h, c) = self.lstm(encoded_cond_norm_hist) # Get final state
+            last_cond_norm_segment = current_cond_norm_input[:, -1:, :] # Shape: (B, 1, features_per_segment)
 
             for _ in range(steps):
-                encoded_last_norm_segment = self.encoder(last_normalized_segment) # Shape: (B, 1, encoding_dim)
-
-                # Pass through LSTM using previous state
-                lstm_out_normalized_step, (h, c) = self.lstm(encoded_last_norm_segment, (h, c))
-
-                # Decode the output (still normalized)
-                decoded_normalized = self.decoder(lstm_out_normalized_step) # Shape: (B, 1, features_per_segment)
-                future_predictions_normalized.append(decoded_normalized)
-
-                # Update last_normalized_segment for next iteration
-                last_normalized_segment = decoded_normalized
+                encoded_last_cond_norm_segment = self.encoder(last_cond_norm_segment) # Shape: (B, 1, encoding_dim)
+                lstm_out_cond_norm_step, (h, c) = self.lstm(encoded_last_cond_norm_segment, (h, c))
+                decoded_cond_norm = self.decoder(lstm_out_cond_norm_step) # Conditionally normalized
+                future_predictions_cond_norm.append(decoded_cond_norm)
+                last_cond_norm_segment = decoded_cond_norm
             # --- End Prediction Loop ---
 
-            # Concatenate normalized predictions
-            # Shape: (batch_size, steps, features_per_segment)
-            final_normalized_predictions_segmented = torch.cat(future_predictions_normalized, dim=1)
+            # Concatenate predictions (still conditionally normalized)
+            final_cond_norm_predictions_segmented = torch.cat(future_predictions_cond_norm, dim=1) # (B, steps, F_seg)
 
-            # --- RevIN De-normalization ---
-            # Reshape normalized predictions back into time series format
-            # (B, steps, F*MinPerSeg) -> (B, steps*MinPerSeg, F)
+            # --- Conditional De-normalization ---
+            # Reshape predictions back into time series format
             predicted_time_steps = steps * self.minutes_per_segment
-            final_norm_pred_reshaped = final_normalized_predictions_segmented.view(batch_size, steps, self.num_original_features, self.minutes_per_segment)
-            final_norm_pred_reshaped = final_norm_pred_reshaped.permute(0, 1, 3, 2) # -> (B, steps, MinPerSeg, F)
-            final_norm_pred_reshaped = final_norm_pred_reshaped.reshape(batch_size, predicted_time_steps, self.num_original_features) # -> (B, predicted_time_steps, F)
+            final_cond_norm_pred_reshaped = final_cond_norm_predictions_segmented.view(batch_size, steps, self.num_original_features, self.minutes_per_segment)
+            final_cond_norm_pred_reshaped = final_cond_norm_pred_reshaped.permute(0, 1, 3, 2).reshape(batch_size, predicted_time_steps, self.num_original_features) # (B, pred_T, F)
 
-            # Apply RevIN de-normalization using stats from original normalization
-            final_denorm_pred_reshaped = self.rev_in(final_norm_pred_reshaped, mode='denorm')
+            # Apply RevIN de-norm (using stats stored during normalization)
+            final_denorm_pred_all = self.rev_in(final_cond_norm_pred_reshaped, mode='denorm')
 
-            # Reshape de-normalized time series back into segments
-            # (B, predicted_time_steps, F) -> (B, steps, features_per_segment)
-            final_predictions_segmented = final_denorm_pred_reshaped.view(batch_size, steps, self.minutes_per_segment, self.num_original_features)
-            final_predictions_segmented = final_predictions_segmented.permute(0, 1, 3, 2) # -> (B, steps, F, MinPerSeg)
-            final_predictions_segmented = final_predictions_segmented.reshape(batch_size, steps, self.features_per_segment) # -> (B, steps, features_per_segment)
-            # --- End RevIN De-normalization ---
+            # Use the *original* skip_revin_mask calculated from the input sequence
+            skip_revin_mask_expanded = skip_revin_mask.expand(-1, predicted_time_steps, -1)
+            final_denorm_pred_final = torch.where(
+                skip_revin_mask_expanded,
+                final_cond_norm_pred_reshaped, # Use non-denormalized if RevIN was skipped
+                final_denorm_pred_all          # Use de-normalized otherwise
+            )
+
+            # Reshape back into segments
+            final_predictions_segmented = final_denorm_pred_final.view(batch_size, steps, self.minutes_per_segment, self.num_original_features)
+            final_predictions_segmented = final_predictions_segmented.permute(0, 1, 3, 2).reshape(batch_size, steps, self.features_per_segment)
+            # --- End Conditional De-normalization ---
 
             return final_predictions_segmented
 
