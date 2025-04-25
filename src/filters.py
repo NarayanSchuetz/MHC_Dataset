@@ -242,17 +242,38 @@ def active_energy_burned_filter(df: pd.DataFrame) -> pd.DataFrame:
     valid = np.ones(len(df), dtype=bool)
     energy_indices = np.flatnonzero(energy_mask)
 
-    if 'endTime' in df.columns:
-        start_times = pd.to_datetime(df.iloc[energy_indices]['startTime']).to_numpy().astype('datetime64[s]')
-        end_times = pd.to_datetime(df.iloc[energy_indices]['endTime']).to_numpy().astype('datetime64[s]')
-        durations = (end_times - start_times).astype('timedelta64[s]').astype(float)
+    # Check if essential time columns are missing for rate calculation
+    if 'endTime' not in df.columns or 'startTime' not in df.columns:
+        print("Warning: 'startTime' or 'endTime' column missing. Filtering out ALL Active Energy records as rate cannot be calculated.")
+        valid[energy_indices] = False
+        return df.iloc[valid] # Return early as no further processing needed for energy records
+
+    # Proceed with rate calculation only if both columns exist
+    start_times = pd.to_datetime(df.iloc[energy_indices]['startTime']).to_numpy().astype('datetime64[s]')
+    end_times = pd.to_datetime(df.iloc[energy_indices]['endTime']).to_numpy().astype('datetime64[s]')
+    durations = (end_times - start_times).astype('timedelta64[s]').astype(float)
+    
+    energy_values = df.iloc[energy_indices]['value'].to_numpy(dtype=float)
+    
+    # Handle potential division by zero or negative duration issues before calculating rate
+    # Mark records with non-positive duration as invalid
+    non_positive_duration_mask = (durations <= 0)
+    valid[energy_indices[non_positive_duration_mask]] = False
+
+    # Create a mask for records that are still potentially valid (positive duration)
+    potentially_valid_indices = energy_indices[durations > 0]
+    
+    if len(potentially_valid_indices) > 0:
+        # Calculate rate only for records with positive duration
+        potentially_valid_durations = durations[durations > 0]
+        potentially_valid_values = energy_values[durations > 0]
+        energy_rate = potentially_valid_values / potentially_valid_durations
         
-        energy_values = df.iloc[energy_indices]['value'].to_numpy(dtype=float)
-        energy_rate = energy_values / durations
+        # Apply the rate limit and non-negative value check to potentially valid records
+        rate_check_passed = (potentially_valid_values >= 0) & (energy_rate <= __MAX_ENERGY_PER_SECOND)
         
-        valid[energy_indices] = (energy_values >= 0) & (energy_rate <= __MAX_ENERGY_PER_SECOND)
-    else:
-        valid[energy_indices] = df.iloc[energy_indices]['value'].to_numpy(dtype=float) >= 0
+        # Update the main valid array only for those checked
+        valid[potentially_valid_indices] = rate_check_passed
 
     return df.iloc[valid]
 

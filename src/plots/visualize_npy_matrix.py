@@ -236,8 +236,7 @@ if __name__ == "__main__":
     
     # Example to visualize a specific NPY file
     visualize_npy_file(
-        "/var/folders/s5/9tx92s6n1r1g20vf5q0j7gxc0000gp/T/tmp7tynf79f/2017-08-03.npy",
-        output_path="/Users/narayanschuetz/tmp_data/verify_data/2017-08-03_visualization.png",
+        "/var/folders/s5/9tx92s6n1r1g20vf5q0j7gxc0000gp/T/tmpd9r8xy0n/2017-08-04.npy",
+        output_path="/Users/narayanschuetz/tmp_data/verify_data/2017-08-04_visualization.png",
         show_plot=True
     )
-

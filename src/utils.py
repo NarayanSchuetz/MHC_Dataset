@@ -1,4 +1,5 @@
 import pandas as pd
+from constants import HKQuantityType
 
 def convert_to_local_time(df, offset_column="startTime_timezone_offset"):
     """
@@ -14,11 +15,13 @@ def convert_to_local_time(df, offset_column="startTime_timezone_offset"):
 def split_intervals_at_midnight(df, start_event_col='startTime', end_event_col='endTime'):
     """
     Splits events that cross midnight into two separate events.
+    If the event has a 'value' column and the 'type' is not HeartRate,
+    the value is split proportionally based on the duration of the new intervals.
     
     Args:
         df: DataFrame with datetime index
-        start_event: Column name for event start time (default: 'startTime') 
-        end_event: Column name for event end time (default: 'endTime')
+        start_event_col: Column name for event start time (default: 'startTime') 
+        end_event_col: Column name for event end time (default: 'endTime')
         
     Returns:
         DataFrame with midnight-crossing events split into separate rows
@@ -43,15 +46,51 @@ def split_intervals_at_midnight(df, start_event_col='startTime', end_event_col='
     
     split_events = []
     for _, event in crossing_events.iterrows():
-        # Create first part - original start to midnight
-        midnight = pd.Timestamp(event[end_event_col].date()) 
+        # Calculate original duration
+        original_start_time = event[start_event_col]
+        original_end_time = event[end_event_col]
+        original_duration = original_end_time - original_start_time
+        original_duration_secs = original_duration.total_seconds()
+
+        # Define split points
+        midnight = pd.Timestamp(original_end_time.date()) 
+        first_part_end_time = midnight - pd.Timedelta(seconds=2)
+        second_part_start_time = midnight
+
+        # Create first part
         first_part = event.copy()
-        first_part[end_event_col] = midnight - pd.Timedelta(microseconds=1)
+        first_part[end_event_col] = first_part_end_time
         
-        # Create second part - midnight to original end
+        # Create second part
         second_part = event.copy()
-        second_part[start_event_col] = midnight
+        second_part[start_event_col] = second_part_start_time
+
+        # Proportionally split value if applicable (not HeartRate and duration > 0)
+        is_heart_rate = 'type' in event and event['type'] == HKQuantityType.HKQuantityTypeIdentifierHeartRate.value
+        has_value = 'value' in event
+
+        if has_value and not is_heart_rate and original_duration_secs > 0:
+            first_part_duration = first_part[end_event_col] - first_part[start_event_col]
+            second_part_duration = second_part[end_event_col] - second_part[start_event_col]
+
+            proportion_first = first_part_duration.total_seconds() / original_duration_secs
+            proportion_second = second_part_duration.total_seconds() / original_duration_secs
+            
+            # Clamp proportions to avoid potential floating point issues leading to > 1 sum
+            proportion_first = max(0.0, min(1.0, proportion_first))
+            proportion_second = max(0.0, min(1.0, proportion_second))
+
+            original_value = event['value']
+            first_part['value'] = original_value * proportion_first
+            second_part['value'] = original_value * proportion_second
+        elif has_value and not is_heart_rate and original_duration_secs <= 0:
+             # Handle zero/negative duration case - assign zero value? Or keep original? Let's assign 0.
+             first_part['value'] = 0
+             second_part['value'] = 0
+             print(f"Warning: Original duration <= 0 for event index {event.name} during split. Assigning 0 value to split parts.")
         
+        # else: Value is kept as original (e.g., for HeartRate or if no 'value' column)
+
         split_events.extend([first_part, second_part])
         
     if split_events:

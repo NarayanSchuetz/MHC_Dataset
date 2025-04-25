@@ -134,9 +134,10 @@ def _get_average_values_healthkit(df_healthkit):
 
         is_heart_rate = df.type == HKQuantityType.HKQuantityTypeIdentifierHeartRate.value
 
-        if duration_secs == 0:  # Handle point estimates (assign value directly)
-            if 0 <= start_index < 24*60*60: # Ensure index is within bounds
-                value_arr[start_index] = df.value 
+        if duration_secs == 0:  # Handle point estimates (assign value directly) only for heart rate as it can mess up other types.
+            if is_heart_rate:
+                if 0 <= start_index < 24*60*60: # Ensure index is within bounds
+                    value_arr[start_index] = df.value 
 
         else:  # Handle normal duration measurements
             duration_secs_int = int(duration_secs) # Use integer for slicing
@@ -145,9 +146,10 @@ def _get_average_values_healthkit(df_healthkit):
                 if start_index < 24*60*60 and start_index < end_index:
                     value_arr[start_index:end_index] = df.value
             else:
+
                 if start_index < 24*60*60 and start_index < end_index:
                     value_arr[start_index:end_index] = df.value / duration_secs 
-            
+
         values.append(value_arr)
     
     if len(values) == 0:
@@ -157,7 +159,7 @@ def _get_average_values_healthkit(df_healthkit):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         average_values = np.nanmean(stacked_values, axis=0)
-    # average_values = np.nan_to_num(average_values, 0)
+
     return average_values
 
 
@@ -303,7 +305,7 @@ def create_dataset(
             print(f"DataFrame for {file_type.value} is empty after filtering.")
             continue # Skip time/interval processing if empty
         
-        # Adjust times based on file type
+        # Adjust times based on file type (also sets initial index)
         _set_time(processed_dfs[file_type], file_type)
         
         # Split intervals: sleep uses a different split method.
@@ -315,6 +317,11 @@ def create_dataset(
                  processed_dfs[file_type] = split_intervals_at_midnight(processed_dfs[file_type])
             else:
                  print(f"Warning: 'endTime' column missing for {file_type.value}, skipping interval splitting.")
+        
+        # Reset index AFTER splitting to ensure grouping uses the correct date, 
+        # especially for the second part of split intervals.
+        if 'startTime' in processed_dfs[file_type].columns and not processed_dfs[file_type].empty:
+            processed_dfs[file_type].index = pd.to_datetime(processed_dfs[file_type]['startTime'])
 
     # Use processed_dfs instead of dfs for the rest of the function
     dfs_dict_daily = {}
@@ -364,7 +371,7 @@ def create_dataset(
             original_time_offset = df_hk_day.iloc[0]['startTime_timezone_offset'] if not df_hk_day.empty and 'startTime_timezone_offset' in df_hk_day.columns else 0
 
         output_filepath = os.path.join(output_root_dir, date.strftime("%Y-%m-%d") + ".npy")
-        
+
         # Generate data or load existing file
         if os.path.exists(output_filepath) and not force_recompute:
             print(f"Skipping data generation for {date} in {output_root_dir}, file exists.")
@@ -385,6 +392,7 @@ def create_dataset(
                  continue # Skip if no data exists for this date at all
 
             print(f"Generating data for {date}...")
+            
             try:
                 daily_minute_level_matrix = _generate_daily_data(dfs_dict_daily, date, skip)
                 np.save(output_filepath, daily_minute_level_matrix)
