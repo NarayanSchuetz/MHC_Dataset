@@ -113,6 +113,12 @@ def _convert_healthkit_units(df: pd.DataFrame) -> pd.DataFrame:
 
 def _get_average_values_healthkit(df_healthkit):
     values = []
+    
+    if df_healthkit.empty: # Early exit if DataFrame is empty
+        return np.zeros(24*60*60, dtype=np.float32)
+
+    # No unit check needed here anymore
+
     for _, df in df_healthkit.iterrows():
         start_time = df.startTime
         end_time = df.endTime
@@ -122,16 +128,25 @@ def _get_average_values_healthkit(df_healthkit):
             continue
             
         start_index = _get_seconds_till_midnight(start_time)
-        
-        if duration.total_seconds() == 0:  # Handle point estimates
-            minute_start = start_index - (start_index % 60)  # Round down to start of minute
-            minute_end = minute_start + 60  # End of the minute
-            value_arr = np.full(24*60*60, np.nan, dtype=np.float32)
-            value_arr[minute_start:minute_end] = df.value
+        duration_secs = duration.total_seconds()
+
+        value_arr = np.full(24*60*60, np.nan, dtype=np.float32)
+
+        is_heart_rate = df.type == HKQuantityType.HKQuantityTypeIdentifierHeartRate.value
+
+        if duration_secs == 0:  # Handle point estimates (assign value directly)
+            if 0 <= start_index < 24*60*60: # Ensure index is within bounds
+                value_arr[start_index] = df.value 
+
         else:  # Handle normal duration measurements
-            end_index = start_index + int(duration.total_seconds())
-            value_arr = np.full(24*60*60, np.nan, dtype=np.float32)
-            value_arr[start_index:end_index] = df.value / duration.total_seconds()
+            duration_secs_int = int(duration_secs) # Use integer for slicing
+            end_index = min(start_index + duration_secs_int, 24*60*60) # Cap end_index
+            if is_heart_rate:  # Heart rate is a rate, so we need to divide by duration all others are counts
+                if start_index < 24*60*60 and start_index < end_index:
+                    value_arr[start_index:end_index] = df.value
+            else:
+                if start_index < 24*60*60 and start_index < end_index:
+                    value_arr[start_index:end_index] = df.value / duration_secs 
             
         values.append(value_arr)
     
@@ -142,37 +157,60 @@ def _get_average_values_healthkit(df_healthkit):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         average_values = np.nanmean(stacked_values, axis=0)
-    average_values = np.nan_to_num(average_values, 0)
+    # average_values = np.nan_to_num(average_values, 0)
     return average_values
 
 
 def _set_time(df, file_type: FileType):
     try:
+        # Always adjust startTime if the column exists
+        if 'startTime' in df.columns and 'startTime_timezone_offset' in df.columns:
+             df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
+             df.index = df['startTime'] # Set index after adjusting startTime
+        elif 'startTime' in df.columns:
+             df.index = pd.to_datetime(df['startTime']).dt.tz_localize(None) # Ensure index is datetime
+        else:
+             print(f"Warning: 'startTime' column missing for {file_type.value}. Cannot set index.")
+             # Handle cases without startTime appropriately, maybe return or raise error
+             return # Or raise an error depending on requirements
+
+        # Adjust endTime based on file type, checking for column existence
         if file_type == FileType.HEALTHKIT:
-            df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
-            df['endTime'] = df.apply(_adjust_end_time, axis=1).dt.tz_localize(None)
-            df.index = df['startTime']
+            if 'endTime' in df.columns and 'endTime_timezone_offset' in df.columns:
+                 df['endTime'] = df.apply(_adjust_end_time, axis=1).dt.tz_localize(None)
+            elif 'endTime' in df.columns:
+                 # Handle case with endTime but no offset
+                 df['endTime'] = pd.to_datetime(df['endTime']).dt.tz_localize(None)
+            else:
+                 print(f"Warning: 'endTime' column missing for {file_type.value}. Cannot adjust endTime.")
+                 # Optionally default endTime, e.g., df['endTime'] = df['startTime']
 
         elif file_type == FileType.MOTION:
-            df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
-            df['endTime'] = df.apply(_adjust_end_time_motion, axis=1).dt.tz_localize(None)
-            df.index = df['startTime']
+            if 'endTime' in df.columns and 'startTime_timezone_offset' in df.columns: # Motion uses startTime offset for endTime
+                 df['endTime'] = df.apply(_adjust_end_time_motion, axis=1).dt.tz_localize(None)
+            elif 'endTime' in df.columns:
+                 df['endTime'] = pd.to_datetime(df['endTime']).dt.tz_localize(None)
+            else:
+                 print(f"Warning: 'endTime' column missing for {file_type.value}. Cannot adjust endTime.")
 
         elif file_type == FileType.WORKOUT:
-            df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
-            df['endTime'] = df.apply(_adjust_end_time, axis=1).dt.tz_localize(None)
-            df.index = df['startTime']
+            if 'endTime' in df.columns and 'endTime_timezone_offset' in df.columns:
+                 df['endTime'] = df.apply(_adjust_end_time, axis=1).dt.tz_localize(None)
+            elif 'endTime' in df.columns:
+                 df['endTime'] = pd.to_datetime(df['endTime']).dt.tz_localize(None)
+            else:
+                 # Handle missing endTime for WORKOUT specifically
+                 print(f"Warning: 'endTime' column missing for {file_type.value}. Defaulting endTime to startTime.")
+                 df['endTime'] = df['startTime'] # Default endTime to startTime as a fallback
 
-        elif file_type == FileType.SLEEP:
-            df['startTime'] = df.apply(_adjust_start_time, axis=1).dt.tz_localize(None)
-            df.index = df['startTime']
+        # No endTime processing needed for SLEEP as it's handled differently later if needed
 
     except Exception as e:
         print("_"*50)
-        print("Is empty", df.empty)
-        print(df.columns)
+        print(f"Error processing time for {file_type.value}")
+        print("Is empty:", df.empty)
+        print("Columns:", df.columns)
         print(df.head())
-        print(file_type)
         raise e
 
 
@@ -324,12 +362,6 @@ def create_dataset(
             df_hk_day = dfs_dict_daily[FileType.HEALTHKIT][date]
             # Use timezone offset from the first record of the day's HealthKit data if available
             original_time_offset = df_hk_day.iloc[0]['startTime_timezone_offset'] if not df_hk_day.empty and 'startTime_timezone_offset' in df_hk_day.columns else 0
-        else:
-            # If no HealthKit data for the day, or HealthKit is skipped, proceed but maybe log/warn?
-            # We need a fallback or decision on how to handle timezone if HK is missing/skipped.
-            # For now, assume 0, but this might need refinement based on requirements.
-            original_time_offset = 0 
-            print(f"Warning: No HealthKit data found for date {date} to determine original timezone offset. Using 0.")
 
         output_filepath = os.path.join(output_root_dir, date.strftime("%Y-%m-%d") + ".npy")
         
@@ -435,6 +467,7 @@ def _generate_healthkit_minute_level_daily_data(df_healthkit_day, date: pd.Times
         average_values = _get_average_values_healthkit(df_day_type)
         average_series = pd.Series(average_values, index=time_index)
         minute_series = average_series.resample('1min').mean()
+        minute_series = minute_series.fillna(0)
         minute_values.append(minute_series.values.astype(np.float32))
 
     # Final matrix consists only of the HealthKit category data.
