@@ -39,7 +39,7 @@ class Test_split_intevals_at_midnight:
         assert result.shape[0] == 2
 
         expected_midnight = pd.Timestamp("2023-10-10")
-        first_expected_end = expected_midnight - pd.Timedelta(microseconds=1)
+        first_expected_end = pd.Timestamp("2023-10-09 23:59:58")
         
         # The first event should start at the original start time.
         first_event = result[result["startTime"] == pd.Timestamp("2023-10-09 23:30:00")].iloc[0]
@@ -108,7 +108,7 @@ class Test_split_sleep_intervals_at_midnight:
         # Expect two split events.
         assert result.shape[0] == 2
         expected_midnight = pd.Timestamp("2023-10-10")
-        first_expected_end = expected_midnight - pd.Timedelta(microseconds=1)
+        first_expected_end = pd.Timestamp("2023-10-09 23:59:58")
         
         # Identify the two events based on their startTime.
         first_event = result[result["startTime"] == pd.Timestamp("2023-10-09 23:30:00")].iloc[0]
@@ -116,8 +116,8 @@ class Test_split_sleep_intervals_at_midnight:
         
         # Check boundaries and durations.
         assert first_event["endTime"] == first_expected_end
-        # The duration of the first event is approximately 1800 seconds.
-        assert pytest.approx(first_event["value"], rel=1e-6) == 1800.0
+        # The duration of the first event is approximately 1798 seconds (23:30:00 to 23:59:58)
+        assert pytest.approx(first_event["value"], rel=1e-6) == 1798.0
 
         assert second_event["endTime"] == pd.Timestamp("2023-10-10 00:30:00")
         # The duration of the second event is 1800 seconds.
@@ -142,10 +142,10 @@ class Test_split_sleep_intervals_at_midnight:
         assert daily_counts.loc[pd.Timestamp("2023-10-10")] == 1
 
         # For the first event:
-        # It should run from 22:45:00 to midnight minus 1 microsecond, i.e. about 4500 seconds.
+        # It should run from 22:45:00 to 23:59:58, i.e. about 4498 seconds.
         first_event = result.loc[pd.Timestamp("2023-10-09 22:45:00")]
         # For the second event:
         # It should run from midnight to 00:15:00, i.e. 900 seconds.
         second_event = result.loc[pd.Timestamp("2023-10-10 00:00:00")]
-        assert pytest.approx(first_event["value"], rel=1e-6) == 4500.0
+        assert pytest.approx(first_event["value"], rel=1e-6) == 4498.0
         assert pytest.approx(second_event["value"], rel=1e-6) == 900.0

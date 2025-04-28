@@ -30,6 +30,7 @@ class AutoencoderLSTM(nn.Module):
         use_masked_loss: bool = False,  # Whether to use the mask for loss calculation
         teacher_forcing_ratio: float = 0.5,  # Ratio of steps to use teacher forcing
         num_features: int = 24,  # Number of features per minute (default is all 24)
+        force_teacher_forcing: bool = False,  # Whether to force using teacher forcing regardless of training mode
     ):
         """
         Initialize the Autoencoder LSTM model.
@@ -45,6 +46,7 @@ class AutoencoderLSTM(nn.Module):
             use_masked_loss: Whether to use the binary mask to exclude missing values from loss calculation
             teacher_forcing_ratio: Probability of using teacher forcing during training (0.0 to 1.0)
             num_features: Number of original features per minute (e.g., 24)
+            force_teacher_forcing: Whether to force using teacher forcing regardless of training mode
         """
         super().__init__()
         
@@ -58,6 +60,7 @@ class AutoencoderLSTM(nn.Module):
         self.use_masked_loss = use_masked_loss
         self.teacher_forcing_ratio = teacher_forcing_ratio
         self.num_original_features = num_features # Store the original number of features (e.g., 24)
+        self.force_teacher_forcing = force_teacher_forcing
         
         # Constants for data structure
         self.minutes_per_segment = 30
@@ -176,7 +179,8 @@ class AutoencoderLSTM(nn.Module):
             outputs.append(decoded)
 
             if t < seq_len - 1:
-                use_teacher_forcing = self.training and (torch.rand(1).item() < self.teacher_forcing_ratio)
+                # Check for teacher forcing - either in training mode or if forced
+                use_teacher_forcing = (self.training or self.force_teacher_forcing) and (torch.rand(1).item() < self.teacher_forcing_ratio)
                 if use_teacher_forcing:
                     next_input = input_segments[:, t+1:t+2, :] # Ground truth segment
                 else:
@@ -354,6 +358,7 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
         use_masked_loss: bool = False,
         teacher_forcing_ratio: float = 0.5,
         num_features: int = 24, # This is num_original_features
+        force_teacher_forcing: bool = False, # Whether to force using teacher forcing regardless of training mode
         rev_in_affine: bool = False,
         rev_in_subtract_last: bool = False,
         rev_in_eps: float = 1e-5
@@ -363,6 +368,7 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
 
         Args:
             num_features: Number of original features per minute (e.g., 24)
+            force_teacher_forcing: Whether to force using teacher forcing regardless of training mode
             rev_in_affine: If True, RevIN layer has learnable affine parameters
             rev_in_subtract_last: If True, RevIN subtracts last element instead of mean
             Other args are passed to AutoencoderLSTM.__init__
@@ -377,7 +383,8 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
             prediction_horizon=prediction_horizon,
             use_masked_loss=use_masked_loss,
             teacher_forcing_ratio=teacher_forcing_ratio,
-            num_features=num_features # Passes num_original_features to parent
+            num_features=num_features, # Passes num_original_features to parent
+            force_teacher_forcing=force_teacher_forcing
         )
 
         # Instantiate RevIN layer - operates on the original features dimension
@@ -463,7 +470,8 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
             outputs_conditionally_normalized.append(decoded_cond_norm)
 
             if t < seq_len - 1:
-                use_teacher_forcing = self.training and (torch.rand(1).item() < self.teacher_forcing_ratio)
+                # Check for teacher forcing - either in training mode or if forced
+                use_teacher_forcing = (self.training or self.force_teacher_forcing) and (torch.rand(1).item() < self.teacher_forcing_ratio)
                 if use_teacher_forcing:
                     next_input_cond_norm = input_segments_norm[:, t+1:t+2, :]
                 else:
@@ -691,18 +699,29 @@ class LSTMTrainer:
             
         return total_loss / len(dataloader)
     
-    def validate(self, dataloader: torch.utils.data.DataLoader) -> float:
+    def validate(self, dataloader: torch.utils.data.DataLoader, use_teacher_forcing: Optional[bool] = None) -> float:
         """
         Validate the model.
         
         Args:
             dataloader: DataLoader providing batches from the MHC dataset
+            use_teacher_forcing: Whether to use teacher forcing during validation.
+                                If None, uses normal eval mode behavior (no teacher forcing).
+                                If True, forces teacher forcing with the model's teacher_forcing_ratio.
+                                If False, ensures teacher forcing is disabled.
             
         Returns:
             Average validation loss
         """
-        self.model.eval()
+        self.model.eval()  # Always set to eval mode for validation
         total_loss = 0
+        
+        # Store original force_teacher_forcing flag to restore later
+        original_force_tf = self.model.force_teacher_forcing
+        
+        # Set force_teacher_forcing based on user preference
+        if use_teacher_forcing is not None:
+            self.model.force_teacher_forcing = use_teacher_forcing
         
         with torch.no_grad():
             for batch in dataloader:
@@ -730,8 +749,13 @@ class LSTMTrainer:
                 loss = self.model.compute_loss(model_output, batch)
                 
                 total_loss += loss.item()
+        
+        # Restore original force_teacher_forcing flag
+        self.model.force_teacher_forcing = original_force_tf
                 
         return total_loss / len(dataloader)
+    
+    
 
 def load_checkpoint(
     checkpoint_path: str, 

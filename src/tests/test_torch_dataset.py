@@ -11,7 +11,7 @@ import warnings
 import logging # Import logging
 
 # Adjust import path based on your project structure
-from src.torch_dataset import BaseMhcDataset, FilteredMhcDataset, _EXPECTED_RAW_FEATURES, _EXPECTED_TIME_POINTS
+from src.torch_dataset import BaseMhcDataset, FilteredMhcDataset, _EXPECTED_RAW_FEATURES, _EXPECTED_TIME_POINTS, ForecastingEvaluationDataset
 
 class TestMhcDatasets(unittest.TestCase):
 
@@ -754,6 +754,357 @@ class TestMhcDatasets(unittest.TestCase):
              dataset[7] # Index 7 is out of bounds for the filtered length
          with self.assertRaises(IndexError):
              dataset[-1] # Negative indices not directly supported by iloc logic, should raise
+
+
+class TestForecastingEvaluationDataset(unittest.TestCase):
+    """Tests for the ForecastingEvaluationDataset class."""
+    
+    def setUp(self):
+        """Set up a temporary directory with dummy data for testing."""
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root_dir = Path(self.temp_dir.name)
+        self.raw_features = _EXPECTED_RAW_FEATURES # 24
+        self.time_points = _EXPECTED_TIME_POINTS # 1440
+
+        # Create dummy participant directories
+        self.p1_dir = self.root_dir / "healthCode1"
+        self.p1_dir.mkdir()
+
+        # Create dummy .npy files for testing
+        # Shape: (Mask+Data=2, Features, Time)
+        self.day1_p1_data = np.random.rand(2, self.raw_features, self.time_points).astype(np.float32)
+        # Make mask binary for clarity
+        self.day1_p1_data[0, :, :] = np.random.randint(0, 2, size=(self.raw_features, self.time_points)).astype(np.float32)
+        self.day1_p1_path = self.p1_dir / "2023-01-15.npy"
+        np.save(self.day1_p1_path, self.day1_p1_data)
+
+        # Create sample DataFrame
+        data = {
+            'healthCode': ["healthCode1"],
+            'time_range': ["2023-01-15_2023-01-15"],
+            'file_uris': [["healthCode1/2023-01-15.npy"]],
+            'labelA_value': [1.0],
+            'labelB_value': [0.5]
+        }
+        self.df = pd.DataFrame(data)
+
+    def tearDown(self):
+        """Clean up the temporary directory."""
+        self.temp_dir.cleanup()
+
+    def test_init_valid_parameters(self):
+        """Test initialization with valid parameters."""
+        sequence_len = 480
+        prediction_horizon = 240
+        overlap = 60
+        dataset = ForecastingEvaluationDataset(
+            self.df, 
+            self.root_dir,
+            sequence_len=sequence_len,
+            prediction_horizon=prediction_horizon,
+            overlap=overlap
+        )
+        
+        self.assertEqual(dataset.sequence_len, sequence_len)
+        self.assertEqual(dataset.prediction_horizon, prediction_horizon)
+        self.assertEqual(dataset.overlap, overlap)
+        self.assertEqual(len(dataset), 1)
+
+    def test_init_invalid_parameters(self):
+        """Test initialization with invalid parameters."""
+        # Test non-integer sequence_len
+        with self.assertRaisesRegex(ValueError, "sequence_len must be a positive integer"):
+            ForecastingEvaluationDataset(
+                self.df, self.root_dir, 
+                sequence_len=0.5, prediction_horizon=240, overlap=0
+            )
+        
+        # Test non-positive sequence_len
+        with self.assertRaisesRegex(ValueError, "sequence_len must be a positive integer"):
+            ForecastingEvaluationDataset(
+                self.df, self.root_dir, 
+                sequence_len=0, prediction_horizon=240, overlap=0
+            )
+            
+        # Test non-integer prediction_horizon
+        with self.assertRaisesRegex(ValueError, "prediction_horizon must be a positive integer"):
+            ForecastingEvaluationDataset(
+                self.df, self.root_dir, 
+                sequence_len=480, prediction_horizon="240", overlap=0
+            )
+            
+        # Test non-positive prediction_horizon
+        with self.assertRaisesRegex(ValueError, "prediction_horizon must be a positive integer"):
+            ForecastingEvaluationDataset(
+                self.df, self.root_dir, 
+                sequence_len=480, prediction_horizon=0, overlap=0
+            )
+            
+        # Test non-integer overlap
+        with self.assertRaisesRegex(ValueError, "overlap must be an integer"):
+            ForecastingEvaluationDataset(
+                self.df, self.root_dir, 
+                sequence_len=480, prediction_horizon=240, overlap=0.5
+            )
+            
+        # Test negative y_start (sequence_len - overlap < 0)
+        with self.assertRaisesRegex(ValueError, "Calculated y_start index .* is negative"):
+            ForecastingEvaluationDataset(
+                self.df, self.root_dir, 
+                sequence_len=100, prediction_horizon=240, overlap=200
+            )
+            
+        # Test sequence_len exceeds time points
+        with self.assertRaisesRegex(ValueError, "Required sequence_len .* exceeds available time points"):
+            ForecastingEvaluationDataset(
+                self.df, self.root_dir, 
+                sequence_len=self.time_points + 100, prediction_horizon=240, overlap=0
+            )
+            
+        # Test y_end exceeds time points
+        with self.assertRaisesRegex(ValueError, "The end index for the prediction horizon .* exceeds available time points"):
+            ForecastingEvaluationDataset(
+                self.df, self.root_dir, 
+                sequence_len=self.time_points - 100, prediction_horizon=200, overlap=0
+            )
+
+    def test_getitem_zero_overlap(self):
+        """Test __getitem__ with zero overlap between x and y."""
+        sequence_len = 480
+        prediction_horizon = 240
+        overlap = 0
+        dataset = ForecastingEvaluationDataset(
+            self.df, 
+            self.root_dir,
+            sequence_len=sequence_len,
+            prediction_horizon=prediction_horizon,
+            overlap=overlap
+        )
+        
+        sample = dataset[0]
+        
+        # Check structure of returned dictionary
+        self.assertIn('data_x', sample)
+        self.assertIn('data_y', sample)
+        self.assertIn('labels', sample)
+        self.assertIn('metadata', sample)
+        self.assertNotIn('mask_x', sample)  # No mask by default
+        self.assertNotIn('mask_y', sample)  # No mask by default
+        
+        # Check tensor shapes
+        self.assertEqual(sample['data_x'].shape, (1, self.raw_features, sequence_len))
+        self.assertEqual(sample['data_y'].shape, (1, self.raw_features, prediction_horizon))
+        
+        # Verify split indices (zero overlap means y starts where x ends)
+        # Extract expected data from original array
+        original_data = self.day1_p1_data[1, :, :]  # Data is at index 1
+        expected_x = original_data[:, 0:sequence_len]
+        expected_y = original_data[:, sequence_len:sequence_len+prediction_horizon]
+        
+        # Convert to torch tensors for comparison
+        expected_x_tensor = torch.from_numpy(expected_x)
+        expected_y_tensor = torch.from_numpy(expected_y)
+        
+        # Compare with actual output
+        torch.testing.assert_close(sample['data_x'][0], expected_x_tensor)
+        torch.testing.assert_close(sample['data_y'][0], expected_y_tensor)
+        
+        # Check labels and metadata
+        self.assertEqual(sample['labels']['labelA'], 1.0)
+        self.assertEqual(sample['labels']['labelB'], 0.5)
+        self.assertEqual(sample['metadata']['healthCode'], "healthCode1")
+
+    def test_getitem_positive_overlap(self):
+        """Test __getitem__ with positive overlap between x and y."""
+        sequence_len = 480
+        prediction_horizon = 240
+        overlap = 120  # Positive overlap
+        dataset = ForecastingEvaluationDataset(
+            self.df, 
+            self.root_dir,
+            sequence_len=sequence_len,
+            prediction_horizon=prediction_horizon,
+            overlap=overlap
+        )
+        
+        sample = dataset[0]
+        
+        # Verify split indices with positive overlap
+        x_start = 0
+        x_end = sequence_len
+        y_start = sequence_len - overlap
+        y_end = y_start + prediction_horizon
+        
+        # Extract expected data
+        original_data = self.day1_p1_data[1, :, :]
+        expected_x = original_data[:, x_start:x_end]
+        expected_y = original_data[:, y_start:y_end]
+        
+        # Convert to torch tensors
+        expected_x_tensor = torch.from_numpy(expected_x)
+        expected_y_tensor = torch.from_numpy(expected_y)
+        
+        # Compare with actual output
+        torch.testing.assert_close(sample['data_x'][0], expected_x_tensor)
+        torch.testing.assert_close(sample['data_y'][0], expected_y_tensor)
+        
+        # Explicitly check the overlap region
+        overlap_region_x = sample['data_x'][0, :, sequence_len-overlap:sequence_len]
+        overlap_region_y = sample['data_y'][0, :, 0:overlap]
+        torch.testing.assert_close(overlap_region_x, overlap_region_y)
+
+    def test_getitem_negative_overlap(self):
+        """Test __getitem__ with negative overlap (gap) between x and y."""
+        sequence_len = 480
+        prediction_horizon = 240
+        overlap = -120  # Negative overlap (gap)
+        dataset = ForecastingEvaluationDataset(
+            self.df, 
+            self.root_dir,
+            sequence_len=sequence_len,
+            prediction_horizon=prediction_horizon,
+            overlap=overlap
+        )
+        
+        sample = dataset[0]
+        
+        # Verify split indices with negative overlap
+        x_start = 0
+        x_end = sequence_len
+        y_start = sequence_len - overlap  # With negative overlap, this is > sequence_len
+        y_end = y_start + prediction_horizon
+        
+        # Extract expected data
+        original_data = self.day1_p1_data[1, :, :]
+        expected_x = original_data[:, x_start:x_end]
+        expected_y = original_data[:, y_start:y_end]
+        
+        # Convert to torch tensors
+        expected_x_tensor = torch.from_numpy(expected_x)
+        expected_y_tensor = torch.from_numpy(expected_y)
+        
+        # Compare with actual output
+        torch.testing.assert_close(sample['data_x'][0], expected_x_tensor)
+        torch.testing.assert_close(sample['data_y'][0], expected_y_tensor)
+        
+        # Check that there's a gap between end of x and start of y
+        self.assertEqual(y_start - x_end, -overlap)
+
+    def test_getitem_with_mask(self):
+        """Test __getitem__ with include_mask=True."""
+        sequence_len = 480
+        prediction_horizon = 240
+        overlap = 0
+        dataset = ForecastingEvaluationDataset(
+            self.df, 
+            self.root_dir,
+            sequence_len=sequence_len,
+            prediction_horizon=prediction_horizon,
+            overlap=overlap,
+            include_mask=True
+        )
+        
+        sample = dataset[0]
+        
+        # Check mask presence and shape
+        self.assertIn('mask_x', sample)
+        self.assertIn('mask_y', sample)
+        self.assertEqual(sample['mask_x'].shape, (1, self.raw_features, sequence_len))
+        self.assertEqual(sample['mask_y'].shape, (1, self.raw_features, prediction_horizon))
+        
+        # Verify mask content
+        original_mask = self.day1_p1_data[0, :, :]  # Mask is at index 0
+        expected_mask_x = original_mask[:, 0:sequence_len]
+        expected_mask_y = original_mask[:, sequence_len:sequence_len+prediction_horizon]
+        
+        expected_mask_x_tensor = torch.from_numpy(expected_mask_x)
+        expected_mask_y_tensor = torch.from_numpy(expected_mask_y)
+        
+        torch.testing.assert_close(sample['mask_x'][0], expected_mask_x_tensor)
+        torch.testing.assert_close(sample['mask_y'][0], expected_mask_y_tensor)
+
+    def test_getitem_with_feature_selection(self):
+        """Test __getitem__ with feature selection."""
+        sequence_len = 480
+        prediction_horizon = 240
+        overlap = 0
+        feature_indices = [0, 5, 10]  # Select only these features
+        
+        dataset = ForecastingEvaluationDataset(
+            self.df, 
+            self.root_dir,
+            sequence_len=sequence_len,
+            prediction_horizon=prediction_horizon,
+            overlap=overlap,
+            feature_indices=feature_indices
+        )
+        
+        sample = dataset[0]
+        
+        # Check shapes reflect feature selection
+        self.assertEqual(sample['data_x'].shape, (1, len(feature_indices), sequence_len))
+        self.assertEqual(sample['data_y'].shape, (1, len(feature_indices), prediction_horizon))
+        
+        # Verify content for selected features
+        original_data = self.day1_p1_data[1, :, :]
+        expected_x = original_data[feature_indices, 0:sequence_len]
+        expected_y = original_data[feature_indices, sequence_len:sequence_len+prediction_horizon]
+        
+        # Convert to torch tensors - need to adjust shape for selected features
+        expected_x_tensor = torch.from_numpy(expected_x)
+        expected_y_tensor = torch.from_numpy(expected_y)
+        
+        # Compare with actual output
+        for i, feature_idx in enumerate(feature_indices):
+            torch.testing.assert_close(sample['data_x'][0, i, :], expected_x_tensor[i, :])
+            torch.testing.assert_close(sample['data_y'][0, i, :], expected_y_tensor[i, :])
+
+    def test_getitem_with_standardization(self):
+        """Test __getitem__ with feature standardization."""
+        sequence_len = 480
+        prediction_horizon = 240
+        overlap = 0
+        # Set up feature stats for standardization
+        mean0, std0 = 0.5, 2.0
+        mean5, std5 = 0.0, 1.0
+        feature_stats = {0: (mean0, std0), 5: (mean5, std5)}
+        
+        dataset = ForecastingEvaluationDataset(
+            self.df, 
+            self.root_dir,
+            sequence_len=sequence_len,
+            prediction_horizon=prediction_horizon,
+            overlap=overlap,
+            feature_stats=feature_stats
+        )
+        
+        sample = dataset[0]
+        
+        # Extract original data for standardized features
+        original_data = self.day1_p1_data[1, :, :]
+        
+        # Manually apply standardization to original data
+        standardized_data = original_data.copy()
+        standardized_data[0, :] = (standardized_data[0, :] - mean0) / std0
+        standardized_data[5, :] = (standardized_data[5, :] - mean5) / std5
+        
+        # Split the standardized data for x and y
+        expected_x = standardized_data[:, 0:sequence_len]
+        expected_y = standardized_data[:, sequence_len:sequence_len+prediction_horizon]
+        
+        # Convert to torch tensors
+        expected_x_tensor = torch.from_numpy(expected_x)
+        expected_y_tensor = torch.from_numpy(expected_y)
+        
+        # Check standardized features
+        torch.testing.assert_close(sample['data_x'][0, 0, :], expected_x_tensor[0, :])
+        torch.testing.assert_close(sample['data_y'][0, 0, :], expected_y_tensor[0, :])
+        torch.testing.assert_close(sample['data_x'][0, 5, :], expected_x_tensor[5, :])
+        torch.testing.assert_close(sample['data_y'][0, 5, :], expected_y_tensor[5, :])
+        
+        # Check a non-standardized feature (e.g., feature 1)
+        torch.testing.assert_close(sample['data_x'][0, 1, :], expected_x_tensor[1, :])
+        torch.testing.assert_close(sample['data_y'][0, 1, :], expected_y_tensor[1, :])
 
 
 if __name__ == '__main__':

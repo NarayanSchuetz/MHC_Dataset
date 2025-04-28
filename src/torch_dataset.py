@@ -527,3 +527,155 @@ class FilteredMhcDataset(BaseMhcDataset):
 
         # Store the label of interest for reference
         self.label_of_interest = label_of_interest
+
+
+class ForecastingEvaluationDataset(BaseMhcDataset):
+    """
+    A subclass of BaseMhcDataset designed for forecasting tasks.
+
+    It takes the time series data loaded by the parent class and splits it
+    into input sequences (data_x) and target sequences (data_y) based on
+    specified lengths and overlap.
+
+    The splitting occurs along the time dimension (axis 2, typically 1440 points).
+
+    Assumes the base data loaded by `BaseMhcDataset.__getitem__` has shape
+    (num_days, num_selected_features, num_time_points).
+
+    Output `data_x` shape: (num_days, num_selected_features, sequence_len)
+    Output `data_y` shape: (num_days, num_selected_features, prediction_horizon)
+    Output `mask_x`/`mask_y` shapes follow `data_x`/`data_y` if `include_mask=True`.
+
+    Raises:
+        ValueError: If `sequence_len`, `prediction_horizon`, or `overlap` parameters
+                    are invalid or result in indices outside the available time points
+                    (assumed to be `_EXPECTED_TIME_POINTS`).
+    """
+    def __init__(self,
+                 dataframe: pd.DataFrame,
+                 root_dir: str,
+                 sequence_len: int,
+                 prediction_horizon: int,
+                 overlap: int = 0,
+                 include_mask: bool = False,
+                 feature_indices: Optional[List[int]] = None,
+                 feature_stats: Optional[dict] = None):
+        """
+        Args:
+            dataframe (pd.DataFrame): The denormalized dataframe.
+            root_dir (str): The root directory containing participant subdirectories.
+            sequence_len (int): The length of the input sequence (x) along the time axis.
+            prediction_horizon (int): The length of the target sequence (y) along the time axis.
+            overlap (int): The number of time points the end of x overlaps with the start of y.
+                           Can be positive (overlap), zero (adjacent), or negative (gap).
+                           Defaults to 0.
+            include_mask (bool): Whether to load and include a mask channel. Passed to BaseMhcDataset.
+                                 If True, 'mask_x' and 'mask_y' will be included in the output.
+            feature_indices (Optional[List[int]]): Optional list of feature indices to select.
+                                                    Passed to BaseMhcDataset.
+            feature_stats (Optional[dict]): Optional dictionary for feature standardization.
+                                            Passed to BaseMhcDataset.
+        """
+        # --- Parameter Validation ---
+        if not isinstance(sequence_len, int) or sequence_len <= 0:
+            raise ValueError("sequence_len must be a positive integer.")
+        if not isinstance(prediction_horizon, int) or prediction_horizon <= 0:
+            raise ValueError("prediction_horizon must be a positive integer.")
+        if not isinstance(overlap, int):
+             raise ValueError("overlap must be an integer.")
+
+        # Check if the required time span fits within the expected time points
+        x_start = 0
+        x_end = sequence_len
+        y_start = sequence_len - overlap
+        y_end = y_start + prediction_horizon
+
+        if x_start < 0:
+             raise ValueError("Calculated x_start index is negative (should not happen with current logic).")
+        if y_start < 0:
+             raise ValueError(f"Calculated y_start index ({y_start}) is negative. "
+                              f"Check sequence_len ({sequence_len}) and overlap ({overlap}).")
+        if x_end > _EXPECTED_TIME_POINTS:
+             raise ValueError(f"Required sequence_len ({sequence_len}) exceeds available time points ({_EXPECTED_TIME_POINTS}).")
+        if y_end > _EXPECTED_TIME_POINTS:
+            raise ValueError(f"The end index for the prediction horizon ({y_end}) exceeds "
+                             f"available time points ({_EXPECTED_TIME_POINTS}). Check sequence_len "
+                             f"({sequence_len}), prediction_horizon ({prediction_horizon}), and overlap ({overlap}).")
+
+
+        # --- Store Forecasting Parameters ---
+        self.sequence_len = sequence_len
+        self.prediction_horizon = prediction_horizon
+        self.overlap = overlap
+
+        # --- Initialize Parent Class ---
+        # This handles validation/setup for dataframe, root_dir, include_mask,
+        # feature_indices, and feature_stats.
+        super().__init__(
+            dataframe=dataframe,
+            root_dir=root_dir,
+            include_mask=include_mask,
+            feature_indices=feature_indices,
+            feature_stats=feature_stats
+        )
+        logger.info(f"Initialized ForecastingEvaluationDataset with sequence_len={sequence_len}, "
+                    f"prediction_horizon={prediction_horizon}, overlap={overlap}.")
+        logger.info(f"Input sequence (x) will span indices [{x_start}:{x_end}].")
+        logger.info(f"Target sequence (y) will span indices [{y_start}:{y_end}].")
+
+
+    def __getitem__(self, idx):
+        """
+        Retrieves a sample and splits its time series data into input (x) and target (y).
+
+        Args:
+            idx (int): The index of the sample to retrieve.
+
+        Returns:
+            dict: A dictionary containing:
+                - 'data_x' (torch.Tensor): Input sequence, shape (num_days, num_features, sequence_len).
+                - 'data_y' (torch.Tensor): Target sequence, shape (num_days, num_features, prediction_horizon).
+                - 'mask_x' (torch.Tensor, optional): Mask for input sequence. Included if `include_mask=True`.
+                - 'mask_y' (torch.Tensor, optional): Mask for target sequence. Included if `include_mask=True`.
+                - 'labels' (dict): Label values from the original sample.
+                - 'metadata' (dict): Metadata from the original sample.
+        """
+        # 1. Get the full sample from the base class
+        base_sample = super().__getitem__(idx)
+
+        # 2. Extract full data and mask (if applicable)
+        full_data = base_sample['data'] # Shape: (num_days, num_features, 1440)
+        full_mask = base_sample.get('mask') # Shape: (num_days, num_features, 1440) or None
+
+        # 3. Calculate indices for splitting (consistent with __init__ validation)
+        x_start = 0
+        x_end = self.sequence_len
+        y_start = self.sequence_len - self.overlap
+        y_end = y_start + self.prediction_horizon
+
+        # 4. Perform the split on data tensor (selects time dimension)
+        data_x = full_data[:, :, x_start:x_end]
+        data_y = full_data[:, :, y_start:y_end]
+
+        # 5. Prepare the result dictionary, copying labels and metadata
+        result_dict = {
+            'data_x': data_x,
+            'data_y': data_y,
+            'labels': base_sample['labels'],
+            'metadata': base_sample['metadata']
+        }
+
+        # 6. Perform the split on mask if it exists and was requested
+        if self.include_mask:
+            if full_mask is not None:
+                mask_x = full_mask[:, :, x_start:x_end]
+                mask_y = full_mask[:, :, y_start:y_end]
+                result_dict['mask_x'] = mask_x
+                result_dict['mask_y'] = mask_y
+            else:
+                # This case should ideally not happen if include_mask=True,
+                # but adding a warning for robustness.
+                logger.warning(f"Mask was requested (include_mask=True) but not found in base_sample "
+                               f"for index {idx}. 'mask_x' and 'mask_y' will be missing.")
+
+        return result_dict
