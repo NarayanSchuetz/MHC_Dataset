@@ -532,81 +532,6 @@ class AutoencoderLSTM(nn.Module):
         return results
 
 
-def run_forecast_evaluation(
-    model: Union[AutoencoderLSTM, RevInAutoencoderLSTM],
-    dataframe: pd.DataFrame,
-    root_dir: str,
-    split: Union[str, 'ForecastSplit'] = CommonSplits.FIVE_TO_TWO,
-    batch_size: int = 16,
-    include_mask: bool = True,
-    feature_indices: Optional[List[int]] = None,
-    feature_names: Optional[List[str]] = None,
-    feature_stats: Optional[Dict] = None,
-    device: Optional[torch.device] = None
-) -> Dict:
-    """
-    Run forecast evaluation and print formatted results.
-    
-    Args:
-        model: The LSTM model to evaluate
-        dataframe: DataFrame with MHC dataset metadata
-        root_dir: Root directory for data files
-        split: Either a ForecastSplit instance or string like "5-2d"
-        batch_size: Batch size for evaluation
-        include_mask: Whether to include masks
-        feature_indices: Optional list of feature indices to select
-        feature_names: Optional list of feature names for reporting
-        feature_stats: Optional dictionary for feature standardization
-        device: Device to run evaluation on. If None, uses model's current device.
-    
-    Returns:
-        Dictionary with evaluation results
-    """
-    # Convert string to ForecastSplit if needed
-    if isinstance(split, str):
-        split = ForecastSplit.from_string(split)
-    
-    print(f"Running forecast evaluation with split: {split}")
-    
-    # Run evaluation
-    results = model.evaluate_forecast(
-        dataframe=dataframe,
-        root_dir=root_dir,
-        split=split,
-        batch_size=batch_size,
-        include_mask=include_mask,
-        feature_indices=feature_indices,
-        feature_stats=feature_stats,
-        device=device
-    )
-    
-    # Print overall results
-    print(f"\nOverall MAE: {results['overall_mae']:.4f}")
-    
-    # Print per-channel results
-    print("\nPer-Channel MAE:")
-    channel_maes = results['channel_mae']
-    
-    # Use feature names if provided, otherwise use indices
-    if feature_names and len(feature_names) == len(channel_maes):
-        feature_labels = feature_names
-    elif feature_indices and len(feature_indices) == len(channel_maes):
-        feature_labels = [f"Feature {i}" for i in feature_indices]
-    else:
-        feature_labels = [f"Feature {i}" for i in range(len(channel_maes))]
-    
-    # Print table header
-    print(f"{'Feature':<20} {'MAE':<10}")
-    print("-" * 30)
-    
-    # Print each channel's MAE
-    for label, mae in zip(feature_labels, channel_maes):
-        mae_str = f"{mae:.4f}" if not np.isnan(mae) else "NaN"
-        print(f"{label:<20} {mae_str:<10}")
-    
-    return results
-
-
 # New class incorporating RevIN applied to original time series features
 class RevInAutoencoderLSTM(AutoencoderLSTM):
     """
@@ -880,6 +805,80 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
             # --- End Conditional De-normalization ---
 
             return final_predictions_segmented
+        
+def run_forecast_evaluation(
+    model: Union[AutoencoderLSTM, RevInAutoencoderLSTM],
+    dataframe: pd.DataFrame,
+    root_dir: str,
+    split: Union[str, 'ForecastSplit'] = CommonSplits.FIVE_TO_TWO,
+    batch_size: int = 16,
+    include_mask: bool = True,
+    feature_indices: Optional[List[int]] = None,
+    feature_names: Optional[List[str]] = None,
+    feature_stats: Optional[Dict] = None,
+    device: Optional[torch.device] = None
+) -> Dict:
+    """
+    Run forecast evaluation and print formatted results.
+    
+    Args:
+        model: The LSTM model to evaluate
+        dataframe: DataFrame with MHC dataset metadata
+        root_dir: Root directory for data files
+        split: Either a ForecastSplit instance or string like "5-2d"
+        batch_size: Batch size for evaluation
+        include_mask: Whether to include masks
+        feature_indices: Optional list of feature indices to select
+        feature_names: Optional list of feature names for reporting
+        feature_stats: Optional dictionary for feature standardization
+        device: Device to run evaluation on. If None, uses model's current device.
+    
+    Returns:
+        Dictionary with evaluation results
+    """
+    # Convert string to ForecastSplit if needed
+    if isinstance(split, str):
+        split = ForecastSplit.from_string(split)
+    
+    print(f"Running forecast evaluation with split: {split}")
+    
+    # Run evaluation
+    results = model.evaluate_forecast(
+        dataframe=dataframe,
+        root_dir=root_dir,
+        split=split,
+        batch_size=batch_size,
+        include_mask=include_mask,
+        feature_indices=feature_indices,
+        feature_stats=feature_stats,
+        device=device
+    )
+    
+    # Print overall results
+    print(f"\nOverall MAE: {results['overall_mae']:.4f}")
+    
+    # Print per-channel results
+    print("\nPer-Channel MAE:")
+    channel_maes = results['channel_mae']
+    
+    # Use feature names if provided, otherwise use indices
+    if feature_names and len(feature_names) == len(channel_maes):
+        feature_labels = feature_names
+    elif feature_indices and len(feature_indices) == len(channel_maes):
+        feature_labels = [f"Feature {i}" for i in feature_indices]
+    else:
+        feature_labels = [f"Feature {i}" for i in range(len(channel_maes))]
+    
+    # Print table header
+    print(f"{'Feature':<20} {'MAE':<10}")
+    print("-" * 30)
+    
+    # Print each channel's MAE
+    for label, mae in zip(feature_labels, channel_maes):
+        mae_str = f"{mae:.4f}" if not np.isnan(mae) else "NaN"
+        print(f"{label:<20} {mae_str:<10}")
+    
+    return results
 
 
 class LSTMTrainer:
@@ -1023,10 +1022,6 @@ class LSTMTrainer:
                 
         return total_loss / len(dataloader)
     
-
-
-    
-
 
 def load_checkpoint(
     checkpoint_path: str, 
