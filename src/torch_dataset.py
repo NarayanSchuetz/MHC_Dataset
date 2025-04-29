@@ -595,12 +595,6 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
         if y_start < 0:
              raise ValueError(f"Calculated y_start index ({y_start}) is negative. "
                               f"Check sequence_len ({sequence_len}) and overlap ({overlap}).")
-        if x_end > _EXPECTED_TIME_POINTS:
-             raise ValueError(f"Required sequence_len ({sequence_len}) exceeds available time points ({_EXPECTED_TIME_POINTS}).")
-        if y_end > _EXPECTED_TIME_POINTS:
-            raise ValueError(f"The end index for the prediction horizon ({y_end}) exceeds "
-                             f"available time points ({_EXPECTED_TIME_POINTS}). Check sequence_len "
-                             f"({sequence_len}), prediction_horizon ({prediction_horizon}), and overlap ({overlap}).")
 
 
         # --- Store Forecasting Parameters ---
@@ -647,35 +641,53 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
         full_data = base_sample['data'] # Shape: (num_days, num_features, 1440)
         full_mask = base_sample.get('mask') # Shape: (num_days, num_features, 1440) or None
 
-        # 3. Calculate indices for splitting (consistent with __init__ validation)
+        # 3. Get dimensions and calculate total time points
+        num_days, num_features, points_per_day = full_data.shape
+        total_time_points = num_days * points_per_day
+
+        # 4. Flatten the time dimension: (D, F, P) -> (F, D * P)
+        flat_data = full_data.permute(1, 0, 2).reshape(num_features, total_time_points)
+        flat_mask = None
+        if self.include_mask and full_mask is not None:
+            flat_mask = full_mask.permute(1, 0, 2).reshape(num_features, total_time_points)
+        elif self.include_mask and full_mask is None:
+            logger.warning(f"Mask was requested (include_mask=True) but not found in base_sample "
+                           f"for index {idx}. 'mask_x' and 'mask_y' will be missing.")
+
+        # 5. Calculate indices for splitting based on minutes
         x_start = 0
         x_end = self.sequence_len
         y_start = self.sequence_len - self.overlap
         y_end = y_start + self.prediction_horizon
 
-        # 4. Perform the split on data tensor (selects time dimension)
-        data_x = full_data[:, :, x_start:x_end]
-        data_y = full_data[:, :, y_start:y_end]
+        # 6. Validate split indices against total available time points
+        if x_end > total_time_points:
+            raise ValueError(f"Required sequence_len ({self.sequence_len}) exceeds total available time points ({total_time_points}) for sample index {idx}.")
+        if y_end > total_time_points:
+            raise ValueError(f"Required prediction horizon end ({y_end}) exceeds total available time points ({total_time_points}) for sample index {idx}. "
+                             f"(sequence_len={self.sequence_len}, prediction_horizon={self.prediction_horizon}, overlap={self.overlap})")
 
-        # 5. Prepare the result dictionary, copying labels and metadata
+        # 7. Perform the split on the flattened data tensor (selecting time dimension, axis 1)
+        data_x = flat_data[:, x_start:x_end]
+        data_y = flat_data[:, y_start:y_end]
+
+        # 8. Prepare the result dictionary, copying labels and metadata
         result_dict = {
+            # Note the new shape: (num_features, sequence_len)
             'data_x': data_x,
+            # Note the new shape: (num_features, prediction_horizon)
             'data_y': data_y,
             'labels': base_sample['labels'],
             'metadata': base_sample['metadata']
         }
 
-        # 6. Perform the split on mask if it exists and was requested
-        if self.include_mask:
-            if full_mask is not None:
-                mask_x = full_mask[:, :, x_start:x_end]
-                mask_y = full_mask[:, :, y_start:y_end]
-                result_dict['mask_x'] = mask_x
-                result_dict['mask_y'] = mask_y
-            else:
-                # This case should ideally not happen if include_mask=True,
-                # but adding a warning for robustness.
-                logger.warning(f"Mask was requested (include_mask=True) but not found in base_sample "
-                               f"for index {idx}. 'mask_x' and 'mask_y' will be missing.")
+        # 9. Perform the split on the flattened mask if it exists and was requested
+        if self.include_mask and flat_mask is not None:
+            mask_x = flat_mask[:, x_start:x_end]
+            mask_y = flat_mask[:, y_start:y_end]
+            # Shape: (num_features, sequence_len)
+            result_dict['mask_x'] = mask_x
+             # Shape: (num_features, prediction_horizon)
+            result_dict['mask_y'] = mask_y
 
         return result_dict

@@ -853,20 +853,6 @@ class TestForecastingEvaluationDataset(unittest.TestCase):
                 self.df, self.root_dir, 
                 sequence_len=100, prediction_horizon=240, overlap=200
             )
-            
-        # Test sequence_len exceeds time points
-        with self.assertRaisesRegex(ValueError, "Required sequence_len .* exceeds available time points"):
-            ForecastingEvaluationDataset(
-                self.df, self.root_dir, 
-                sequence_len=self.time_points + 100, prediction_horizon=240, overlap=0
-            )
-            
-        # Test y_end exceeds time points
-        with self.assertRaisesRegex(ValueError, "The end index for the prediction horizon .* exceeds available time points"):
-            ForecastingEvaluationDataset(
-                self.df, self.root_dir, 
-                sequence_len=self.time_points - 100, prediction_horizon=200, overlap=0
-            )
 
     def test_getitem_zero_overlap(self):
         """Test __getitem__ with zero overlap between x and y."""
@@ -891,23 +877,27 @@ class TestForecastingEvaluationDataset(unittest.TestCase):
         self.assertNotIn('mask_x', sample)  # No mask by default
         self.assertNotIn('mask_y', sample)  # No mask by default
         
-        # Check tensor shapes
-        self.assertEqual(sample['data_x'].shape, (1, self.raw_features, sequence_len))
-        self.assertEqual(sample['data_y'].shape, (1, self.raw_features, prediction_horizon))
+        # Check tensor shapes - Note the new shape: (num_features, sequence_len/prediction_horizon)
+        self.assertEqual(sample['data_x'].shape, (self.raw_features, sequence_len))
+        self.assertEqual(sample['data_y'].shape, (self.raw_features, prediction_horizon))
         
         # Verify split indices (zero overlap means y starts where x ends)
-        # Extract expected data from original array
+        # Extract expected data from original flattened array
         original_data = self.day1_p1_data[1, :, :]  # Data is at index 1
-        expected_x = original_data[:, 0:sequence_len]
-        expected_y = original_data[:, sequence_len:sequence_len+prediction_horizon]
+        # Flatten the original data for comparison: (F, P) -> (F, T)
+        # In this test, num_days is 1, so total_time_points = self.time_points
+        flat_original_data = original_data # Already (F, T)
+        
+        expected_x = flat_original_data[:, 0:sequence_len]
+        expected_y = flat_original_data[:, sequence_len:sequence_len+prediction_horizon]
         
         # Convert to torch tensors for comparison
         expected_x_tensor = torch.from_numpy(expected_x)
         expected_y_tensor = torch.from_numpy(expected_y)
         
-        # Compare with actual output
-        torch.testing.assert_close(sample['data_x'][0], expected_x_tensor)
-        torch.testing.assert_close(sample['data_y'][0], expected_y_tensor)
+        # Compare with actual output (data_x/data_y are now (num_features, length))
+        torch.testing.assert_close(sample['data_x'], expected_x_tensor)
+        torch.testing.assert_close(sample['data_y'], expected_y_tensor)
         
         # Check labels and metadata
         self.assertEqual(sample['labels']['labelA'], 1.0)
@@ -935,22 +925,23 @@ class TestForecastingEvaluationDataset(unittest.TestCase):
         y_start = sequence_len - overlap
         y_end = y_start + prediction_horizon
         
-        # Extract expected data
+        # Extract expected data from flattened original
         original_data = self.day1_p1_data[1, :, :]
-        expected_x = original_data[:, x_start:x_end]
-        expected_y = original_data[:, y_start:y_end]
+        flat_original_data = original_data # Shape (F, T)
+        expected_x = flat_original_data[:, x_start:x_end]
+        expected_y = flat_original_data[:, y_start:y_end]
         
         # Convert to torch tensors
         expected_x_tensor = torch.from_numpy(expected_x)
         expected_y_tensor = torch.from_numpy(expected_y)
         
         # Compare with actual output
-        torch.testing.assert_close(sample['data_x'][0], expected_x_tensor)
-        torch.testing.assert_close(sample['data_y'][0], expected_y_tensor)
+        torch.testing.assert_close(sample['data_x'], expected_x_tensor)
+        torch.testing.assert_close(sample['data_y'], expected_y_tensor)
         
         # Explicitly check the overlap region
-        overlap_region_x = sample['data_x'][0, :, sequence_len-overlap:sequence_len]
-        overlap_region_y = sample['data_y'][0, :, 0:overlap]
+        overlap_region_x = sample['data_x'][:, sequence_len-overlap:sequence_len]
+        overlap_region_y = sample['data_y'][:, 0:overlap]
         torch.testing.assert_close(overlap_region_x, overlap_region_y)
 
     def test_getitem_negative_overlap(self):
@@ -974,18 +965,19 @@ class TestForecastingEvaluationDataset(unittest.TestCase):
         y_start = sequence_len - overlap  # With negative overlap, this is > sequence_len
         y_end = y_start + prediction_horizon
         
-        # Extract expected data
+        # Extract expected data from flattened original
         original_data = self.day1_p1_data[1, :, :]
-        expected_x = original_data[:, x_start:x_end]
-        expected_y = original_data[:, y_start:y_end]
+        flat_original_data = original_data # Shape (F, T)
+        expected_x = flat_original_data[:, x_start:x_end]
+        expected_y = flat_original_data[:, y_start:y_end]
         
         # Convert to torch tensors
         expected_x_tensor = torch.from_numpy(expected_x)
         expected_y_tensor = torch.from_numpy(expected_y)
         
         # Compare with actual output
-        torch.testing.assert_close(sample['data_x'][0], expected_x_tensor)
-        torch.testing.assert_close(sample['data_y'][0], expected_y_tensor)
+        torch.testing.assert_close(sample['data_x'], expected_x_tensor)
+        torch.testing.assert_close(sample['data_y'], expected_y_tensor)
         
         # Check that there's a gap between end of x and start of y
         self.assertEqual(y_start - x_end, -overlap)
@@ -1006,22 +998,23 @@ class TestForecastingEvaluationDataset(unittest.TestCase):
         
         sample = dataset[0]
         
-        # Check mask presence and shape
+        # Check mask presence and shape - Note new shape: (num_features, length)
         self.assertIn('mask_x', sample)
         self.assertIn('mask_y', sample)
-        self.assertEqual(sample['mask_x'].shape, (1, self.raw_features, sequence_len))
-        self.assertEqual(sample['mask_y'].shape, (1, self.raw_features, prediction_horizon))
+        self.assertEqual(sample['mask_x'].shape, (self.raw_features, sequence_len))
+        self.assertEqual(sample['mask_y'].shape, (self.raw_features, prediction_horizon))
         
-        # Verify mask content
+        # Verify mask content from flattened original mask
         original_mask = self.day1_p1_data[0, :, :]  # Mask is at index 0
-        expected_mask_x = original_mask[:, 0:sequence_len]
-        expected_mask_y = original_mask[:, sequence_len:sequence_len+prediction_horizon]
+        flat_original_mask = original_mask # Shape (F, T)
+        expected_mask_x = flat_original_mask[:, 0:sequence_len]
+        expected_mask_y = flat_original_mask[:, sequence_len:sequence_len+prediction_horizon]
         
         expected_mask_x_tensor = torch.from_numpy(expected_mask_x)
         expected_mask_y_tensor = torch.from_numpy(expected_mask_y)
         
-        torch.testing.assert_close(sample['mask_x'][0], expected_mask_x_tensor)
-        torch.testing.assert_close(sample['mask_y'][0], expected_mask_y_tensor)
+        torch.testing.assert_close(sample['mask_x'], expected_mask_x_tensor)
+        torch.testing.assert_close(sample['mask_y'], expected_mask_y_tensor)
 
     def test_getitem_with_feature_selection(self):
         """Test __getitem__ with feature selection."""
@@ -1041,23 +1034,24 @@ class TestForecastingEvaluationDataset(unittest.TestCase):
         
         sample = dataset[0]
         
-        # Check shapes reflect feature selection
-        self.assertEqual(sample['data_x'].shape, (1, len(feature_indices), sequence_len))
-        self.assertEqual(sample['data_y'].shape, (1, len(feature_indices), prediction_horizon))
+        # Check shapes reflect feature selection - Note new shape (num_selected_features, length)
+        self.assertEqual(sample['data_x'].shape, (len(feature_indices), sequence_len))
+        self.assertEqual(sample['data_y'].shape, (len(feature_indices), prediction_horizon))
         
-        # Verify content for selected features
+        # Verify content for selected features from flattened original
         original_data = self.day1_p1_data[1, :, :]
-        expected_x = original_data[feature_indices, 0:sequence_len]
-        expected_y = original_data[feature_indices, sequence_len:sequence_len+prediction_horizon]
+        flat_original_data = original_data # Shape (F, T)
+        expected_x = flat_original_data[feature_indices, 0:sequence_len]
+        expected_y = flat_original_data[feature_indices, sequence_len:sequence_len+prediction_horizon]
         
         # Convert to torch tensors - need to adjust shape for selected features
         expected_x_tensor = torch.from_numpy(expected_x)
         expected_y_tensor = torch.from_numpy(expected_y)
         
         # Compare with actual output
-        for i, feature_idx in enumerate(feature_indices):
-            torch.testing.assert_close(sample['data_x'][0, i, :], expected_x_tensor[i, :])
-            torch.testing.assert_close(sample['data_y'][0, i, :], expected_y_tensor[i, :])
+        # The output data_x/data_y should directly match the tensors sliced from selected features
+        torch.testing.assert_close(sample['data_x'], expected_x_tensor)
+        torch.testing.assert_close(sample['data_y'], expected_y_tensor)
 
     def test_getitem_with_standardization(self):
         """Test __getitem__ with feature standardization."""
@@ -1082,13 +1076,14 @@ class TestForecastingEvaluationDataset(unittest.TestCase):
         
         # Extract original data for standardized features
         original_data = self.day1_p1_data[1, :, :]
+        flat_original_data = original_data # Shape (F, T)
         
-        # Manually apply standardization to original data
-        standardized_data = original_data.copy()
+        # Manually apply standardization to original flattened data
+        standardized_data = flat_original_data.copy()
         standardized_data[0, :] = (standardized_data[0, :] - mean0) / std0
         standardized_data[5, :] = (standardized_data[5, :] - mean5) / std5
         
-        # Split the standardized data for x and y
+        # Split the standardized flattened data for x and y
         expected_x = standardized_data[:, 0:sequence_len]
         expected_y = standardized_data[:, sequence_len:sequence_len+prediction_horizon]
         
@@ -1096,15 +1091,64 @@ class TestForecastingEvaluationDataset(unittest.TestCase):
         expected_x_tensor = torch.from_numpy(expected_x)
         expected_y_tensor = torch.from_numpy(expected_y)
         
-        # Check standardized features
-        torch.testing.assert_close(sample['data_x'][0, 0, :], expected_x_tensor[0, :])
-        torch.testing.assert_close(sample['data_y'][0, 0, :], expected_y_tensor[0, :])
-        torch.testing.assert_close(sample['data_x'][0, 5, :], expected_x_tensor[5, :])
-        torch.testing.assert_close(sample['data_y'][0, 5, :], expected_y_tensor[5, :])
+        # Check standardized features (feature 0)
+        torch.testing.assert_close(sample['data_x'][0, :], expected_x_tensor[0, :])
+        torch.testing.assert_close(sample['data_y'][0, :], expected_y_tensor[0, :])
+        # Check standardized features (feature 5)
+        torch.testing.assert_close(sample['data_x'][5, :], expected_x_tensor[5, :])
+        torch.testing.assert_close(sample['data_y'][5, :], expected_y_tensor[5, :])
         
         # Check a non-standardized feature (e.g., feature 1)
-        torch.testing.assert_close(sample['data_x'][0, 1, :], expected_x_tensor[1, :])
-        torch.testing.assert_close(sample['data_y'][0, 1, :], expected_y_tensor[1, :])
+        torch.testing.assert_close(sample['data_x'][1, :], expected_x_tensor[1, :])
+        torch.testing.assert_close(sample['data_y'][1, :], expected_y_tensor[1, :])
+
+    def test_getitem_exceeds_total_time(self):
+        """Test __getitem__ raises ValueError if requested length exceeds total time."""
+        # This sample has 1 day = 1440 time points total
+        total_time_points = self.time_points 
+
+        # Case 1: sequence_len exceeds total time
+        dataset_long_seq = ForecastingEvaluationDataset(
+            self.df, self.root_dir,
+            sequence_len=total_time_points + 1,
+            prediction_horizon=100,
+            overlap=0
+        )
+        with self.assertRaisesRegex(ValueError, "Required sequence_len .* exceeds total available time points"):
+            dataset_long_seq[0]
+
+        # Case 2: y_end exceeds total time
+        dataset_long_pred = ForecastingEvaluationDataset(
+            self.df, self.root_dir,
+            sequence_len=total_time_points - 100,
+            prediction_horizon=200, # sequence_len + prediction_horizon > total_time_points
+            overlap=0
+        )
+        with self.assertRaisesRegex(ValueError, "Required prediction horizon end .* exceeds total available time points"):
+            dataset_long_pred[0]
+
+        # Case 3: sequence_len fits, but y_end exceeds due to overlap
+        dataset_long_overlap = ForecastingEvaluationDataset(
+            self.df, self.root_dir,
+            sequence_len=total_time_points - 100,
+            prediction_horizon=150, 
+            overlap=60 # y_end = (1440-100-60) + 150 = 1280 + 150 = 1430 (fits)
+        )
+        # This should NOT raise an error - checking y_end calculation
+        try:
+            dataset_long_overlap[0]
+        except ValueError as e:
+            self.fail(f"Expected split to fit, but got ValueError: {e}")
+        
+        # Now test overlap making it exceed
+        dataset_long_overlap_exceeds = ForecastingEvaluationDataset(
+            self.df, self.root_dir,
+            sequence_len=total_time_points - 100,
+            prediction_horizon=150, 
+            overlap=-60 # y_end = (1440-100 - (-60)) + 150 = 1400 + 150 = 1550 (exceeds)
+        )
+        with self.assertRaisesRegex(ValueError, "Required prediction horizon end .* exceeds total available time points"):
+            dataset_long_overlap_exceeds[0]
 
 
 if __name__ == '__main__':
