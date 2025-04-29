@@ -641,53 +641,68 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
         full_data = base_sample['data'] # Shape: (num_days, num_features, 1440)
         full_mask = base_sample.get('mask') # Shape: (num_days, num_features, 1440) or None
 
-        # 3. Get dimensions and calculate total time points
-        num_days, num_features, points_per_day = full_data.shape
-        total_time_points = num_days * points_per_day
+        # 3. Get dimensions and check divisibility constraints
+        num_days_total, num_features, points_per_day = full_data.shape
+        if points_per_day != _EXPECTED_TIME_POINTS:
+            # This should ideally not happen if base dataset works correctly
+            logger.warning(f"Unexpected points_per_day ({points_per_day}) for sample {idx}. Expected {_EXPECTED_TIME_POINTS}. Proceeding, but check data integrity.")
+        
+        if self.sequence_len % points_per_day != 0:
+             raise ValueError(f"sequence_len ({self.sequence_len}) must be a multiple of points_per_day ({points_per_day}) for day-based splitting.")
+        if self.prediction_horizon % points_per_day != 0:
+            raise ValueError(f"prediction_horizon ({self.prediction_horizon}) must be a multiple of points_per_day ({points_per_day}) for day-based splitting.")
+        if self.overlap % points_per_day != 0:
+             # Allow zero overlap even if not divisible, otherwise require divisibility
+             if self.overlap != 0:
+                raise ValueError(f"overlap ({self.overlap}) must be zero or a multiple of points_per_day ({points_per_day}) for day-based splitting.")
 
-        # 4. Flatten the time dimension: (D, F, P) -> (F, D * P)
-        flat_data = full_data.permute(1, 0, 2).reshape(num_features, total_time_points)
-        flat_mask = None
-        if self.include_mask and full_mask is not None:
-            flat_mask = full_mask.permute(1, 0, 2).reshape(num_features, total_time_points)
-        elif self.include_mask and full_mask is None:
-            logger.warning(f"Mask was requested (include_mask=True) but not found in base_sample "
-                           f"for index {idx}. 'mask_x' and 'mask_y' will be missing.")
+        # 4. Calculate split indices based on days
+        num_days_x = self.sequence_len // points_per_day
+        num_days_y = self.prediction_horizon // points_per_day
+        overlap_days = self.overlap // points_per_day if self.overlap != 0 else 0
 
-        # 5. Calculate indices for splitting based on minutes
-        x_start = 0
-        x_end = self.sequence_len
-        y_start = self.sequence_len - self.overlap
-        y_end = y_start + self.prediction_horizon
+        x_start_day = 0
+        x_end_day = num_days_x
+        y_start_day = num_days_x - overlap_days
+        y_end_day = y_start_day + num_days_y
 
-        # 6. Validate split indices against total available time points
-        if x_end > total_time_points:
-            raise ValueError(f"Required sequence_len ({self.sequence_len}) exceeds total available time points ({total_time_points}) for sample index {idx}.")
-        if y_end > total_time_points:
-            raise ValueError(f"Required prediction horizon end ({y_end}) exceeds total available time points ({total_time_points}) for sample index {idx}. "
-                             f"(sequence_len={self.sequence_len}, prediction_horizon={self.prediction_horizon}, overlap={self.overlap})")
+        # 5. Validate day indices against total available days
+        if x_end_day > num_days_total:
+            raise ValueError(f"Required input days ({num_days_x}) exceeds total available days ({num_days_total}) for sample index {idx}. (sequence_len={self.sequence_len})")
+        if y_end_day > num_days_total:
+             raise ValueError(f"Required target end day ({y_end_day}) exceeds total available days ({num_days_total}) for sample index {idx}. "
+                              f"(input_days={num_days_x}, target_days={num_days_y}, overlap_days={overlap_days})")
+        if y_start_day < 0:
+             # This check might be redundant if overlap validation is strict, but good safety measure
+             raise ValueError(f"Calculated y_start_day ({y_start_day}) is negative for sample index {idx}. Check sequence_len/overlap.")
 
-        # 7. Perform the split on the flattened data tensor (selecting time dimension, axis 1)
-        data_x = flat_data[:, x_start:x_end]
-        data_y = flat_data[:, y_start:y_end]
 
-        # 8. Prepare the result dictionary, copying labels and metadata
+        # 6. Perform the split on the day dimension (axis 0)
+        data_x = full_data[x_start_day:x_end_day, :, :]
+        data_y = full_data[y_start_day:y_end_day, :, :]
+
+        # 7. Prepare the result dictionary, copying labels and metadata
         result_dict = {
-            # Note the new shape: (num_features, sequence_len)
+            # Note the restored shape: (num_days_x, num_features, 1440)
             'data_x': data_x,
-            # Note the new shape: (num_features, prediction_horizon)
+            # Note the restored shape: (num_days_y, num_features, 1440)
             'data_y': data_y,
             'labels': base_sample['labels'],
             'metadata': base_sample['metadata']
         }
 
-        # 9. Perform the split on the flattened mask if it exists and was requested
-        if self.include_mask and flat_mask is not None:
-            mask_x = flat_mask[:, x_start:x_end]
-            mask_y = flat_mask[:, y_start:y_end]
-            # Shape: (num_features, sequence_len)
-            result_dict['mask_x'] = mask_x
-             # Shape: (num_features, prediction_horizon)
-            result_dict['mask_y'] = mask_y
+        # 8. Perform the split on the mask if it exists and was requested
+        if self.include_mask:
+             if full_mask is not None:
+                 mask_x = full_mask[x_start_day:x_end_day, :, :]
+                 mask_y = full_mask[y_start_day:y_end_day, :, :]
+                 # Shape: (num_days_x, num_features, 1440)
+                 result_dict['mask_x'] = mask_x
+                 # Shape: (num_days_y, num_features, 1440)
+                 result_dict['mask_y'] = mask_y
+             else:
+                 logger.warning(f"Mask was requested (include_mask=True) but not found in base_sample "
+                                f"for index {idx}. 'mask_x' and 'mask_y' will be missing.")
+
 
         return result_dict
