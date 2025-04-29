@@ -595,7 +595,14 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
         if y_start < 0:
              raise ValueError(f"Calculated y_start index ({y_start}) is negative. "
                               f"Check sequence_len ({sequence_len}) and overlap ({overlap}).")
-
+                              
+        # Check for divisibility by _EXPECTED_TIME_POINTS (1440)
+        if sequence_len % _EXPECTED_TIME_POINTS != 0:
+            raise ValueError(f"sequence_len ({sequence_len}) must be a multiple of points_per_day ({_EXPECTED_TIME_POINTS}) for day-based splitting.")
+        if prediction_horizon % _EXPECTED_TIME_POINTS != 0:
+            raise ValueError(f"prediction_horizon ({prediction_horizon}) must be a multiple of points_per_day ({_EXPECTED_TIME_POINTS}) for day-based splitting.")
+        if overlap % _EXPECTED_TIME_POINTS != 0 and overlap != 0:
+            raise ValueError(f"overlap ({overlap}) must be zero or a multiple of points_per_day ({_EXPECTED_TIME_POINTS}) for day-based splitting.")
 
         # --- Store Forecasting Parameters ---
         self.sequence_len = sequence_len
@@ -706,3 +713,81 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
 
 
         return result_dict
+
+
+class FlattenedMhcDataset(BaseMhcDataset):
+    """
+    A subclass of BaseMhcDataset that flattens the time dimension.
+
+    It loads the data identically to BaseMhcDataset but reshapes the output
+    'data' and 'mask' tensors to combine the day and time_point dimensions.
+
+    Output sample['data'] shape: (num_selected_features, num_days * 1440)
+    Output sample['mask'] shape (if include_mask=True): (num_selected_features, num_days * 1440)
+    """
+
+    def __init__(self,
+                 dataframe: pd.DataFrame,
+                 root_dir: str,
+                 include_mask: bool = False,
+                 feature_indices: Optional[List[int]] = None,
+                 feature_stats: Optional[dict] = None):
+        """
+        Initializes the FlattenedMhcDataset. Arguments are passed directly
+        to the BaseMhcDataset constructor.
+
+        Args:
+            dataframe (pd.DataFrame): The denormalized dataframe.
+            root_dir (str): The root directory containing participant subdirectories.
+            include_mask (bool): Whether to load and include a mask channel.
+            feature_indices (Optional[List[int]]): Optional list of feature indices.
+            feature_stats (Optional[dict]): Optional dictionary for feature standardization.
+        """
+        super().__init__(dataframe=dataframe,
+                         root_dir=root_dir,
+                         include_mask=include_mask,
+                         feature_indices=feature_indices,
+                         feature_stats=feature_stats)
+        logger.info("Initialized FlattenedMhcDataset. Output data/mask shape will be (num_features, num_days * 1440).")
+
+    def __getitem__(self, idx):
+        """
+        Retrieves a sample from the dataset and reshapes the data/mask tensors.
+
+        Calls the parent __getitem__ and then reshapes the 'data' and 'mask'
+        tensors from (num_days, num_features, 1440) to
+        (num_features, num_days * 1440).
+
+        Args:
+            idx (int): The index of the sample to retrieve.
+
+        Returns:
+            dict: A dictionary containing:
+                - 'data' (torch.Tensor): Shape (num_selected_features, num_days * 1440).
+                - 'mask' (torch.Tensor, optional): Shape (num_selected_features, num_days * 1440).
+                - 'labels' (dict): Label values.
+                - 'metadata' (dict): Metadata.
+        """
+        # Get the original sample with shape (D, F, T)
+        sample = super().__getitem__(idx)
+
+        data_tensor = sample['data'] # Shape (D, F, T)
+        num_days, num_features, time_points = data_tensor.shape
+        total_time_points = num_days * time_points
+
+        # Reshape data: (D, F, T) -> (F, D, T) -> (F, D * T)
+        reshaped_data = data_tensor.permute(1, 0, 2).reshape(num_features, total_time_points)
+        sample['data'] = reshaped_data
+
+        # Reshape mask if it exists
+        if 'mask' in sample:
+            mask_tensor = sample['mask'] # Shape (D, F, T)
+            # Ensure mask shape matches data shape before permuting
+            if mask_tensor.shape == (num_days, num_features, time_points):
+                 reshaped_mask = mask_tensor.permute(1, 0, 2).reshape(num_features, total_time_points)
+                 sample['mask'] = reshaped_mask
+            else:
+                 logger.warning(f"Mask shape {mask_tensor.shape} does not match data shape {(num_days, num_features, time_points)} for sample {idx}. Skipping mask reshape.")
+
+
+        return sample

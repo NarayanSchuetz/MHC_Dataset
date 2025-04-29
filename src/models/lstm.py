@@ -418,37 +418,62 @@ class AutoencoderLSTM(nn.Module):
                 if mask_y is not None:
                     mask_y = mask_y.to(device)
                 
-                # Reshape data for prediction
-                batch_size, num_days, num_features, time_steps_x = data_x.shape
-                
-                # Reshape to [B, num_days*segments_per_day, num_features*minutes_per_segment]
-                # For the LSTM model's input format
-                segments_per_day = self.segments_per_day
+                # Get input dimensions (Batch, Days, Features, Points_per_day)
+                B, D_x, F_x, P_x = data_x.shape 
+                # Get target dimensions (Batch, Days, Features, Points_per_day) - should match F, P
+                _, D_y, F_y, P_y = data_y.shape
+
+                if F_x != F_y or P_x != P_y or P_x != self.time_points:
+                    logger.warning(f"Shape mismatch or unexpected time points. data_x: {data_x.shape}, data_y: {data_y.shape}, expected points: {self.time_points}")
+                    # Handle error or proceed with caution - let's use F_x and P_x
+                    num_features = F_x
+                    points_per_day = P_x
+                else:
+                    num_features = F_x
+                    points_per_day = P_x
+
+                # Define segmentation parameters
+                segments_per_day = points_per_day // self.minutes_per_segment
                 minutes_per_segment = self.minutes_per_segment
+                features_per_segment = num_features * minutes_per_segment
+
+                # --- Correct Reshape data_x for predict_future --- 
+                # Input: (B, D_x, F, P) 
+                # Output needed: (B, num_input_segments, features_per_segment)
+                num_input_segments = D_x * segments_per_day
                 
-                # Calculate how many segments we have in the input
-                input_segments = (num_days * time_steps_x) // (minutes_per_segment)
-                
-                # Reshape data_x to match model's expected input shape for segments
-                reshaped_data_x = data_x.view(batch_size, num_days, num_features, input_segments, minutes_per_segment)
-                reshaped_data_x = reshaped_data_x.permute(0, 1, 3, 2, 4)  # -> [B, num_days, segments, num_features, minutes_per_segment]
-                reshaped_data_x = reshaped_data_x.reshape(batch_size, input_segments, num_features * minutes_per_segment)
+                # Reshape: (B, D_x, F, P) -> (B, D_x, F, S_p_day, M) -> (B, D_x, S_p_day, F, M) -> (B, D_x*S_p_day, F*M)
+                try:
+                    reshaped_data_x = data_x.view(B, D_x, num_features, segments_per_day, minutes_per_segment)
+                    reshaped_data_x = reshaped_data_x.permute(0, 1, 3, 2, 4) # -> (B, D_x, S, F, M)
+                    reshaped_data_x = reshaped_data_x.reshape(B, num_input_segments, features_per_segment) 
+                except Exception as e:
+                    raise RuntimeError(f"Error reshaping data_x from {data_x.shape} with B={B}, D_x={D_x}, F={num_features}, S={segments_per_day}, M={minutes_per_segment}. Error: {e}") from e
+                # --- End Reshape data_x ---
                 
                 # Calculate how many segments we need to predict
-                # Convert prediction_horizon (in minutes) to number of segments
-                target_segments = split.prediction_horizon // minutes_per_segment
+                # Prediction horizon comes from data_y's day dimension D_y
+                target_segments = D_y * segments_per_day 
                 
-                # Generate predictions
-                predictions = self.predict_future(reshaped_data_x, steps=target_segments)
+                # Generate predictions using the model's prediction method
+                # predict_future expects (B, S_in, F_seg) and returns (B, S_pred, F_seg)
+                predictions_segmented = self.predict_future(reshaped_data_x, steps=target_segments)
                 
-                # Reshape predictions to match data_y shape for comparison
-                # Predictions shape: [B, target_segments, num_features*minutes_per_segment]
-                pred_days = target_segments // segments_per_day
-                reshaped_preds = predictions.view(batch_size, target_segments, num_features, minutes_per_segment)
-                reshaped_preds = reshaped_preds.permute(0, 1, 3, 2)  # -> [B, target_segments, minutes_per_segment, num_features]
-                reshaped_preds = reshaped_preds.reshape(batch_size, pred_days, num_features, split.prediction_horizon)
+                # --- Reshape predictions to match data_y shape --- 
+                # Input: (B, S_pred, F_seg) where S_pred = target_segments = D_y * segments_per_day
+                # Output needed: (B, D_y, F, P) 
                 
-                # Calculate absolute error
+                # Reshape: (B, S_pred, F * M) -> (B, S_pred, F, M) -> (B, D_y, S_p_day, F, M) -> (B, D_y, F, S_p_day, M) -> (B, D_y, F, P)
+                try:
+                    reshaped_preds = predictions_segmented.view(B, target_segments, num_features, minutes_per_segment)
+                    reshaped_preds = reshaped_preds.view(B, D_y, segments_per_day, num_features, minutes_per_segment) # Split S_pred into D_y and S_p_day
+                    reshaped_preds = reshaped_preds.permute(0, 1, 3, 2, 4) # -> (B, D_y, F, S_p_day, M)
+                    reshaped_preds = reshaped_preds.reshape(B, D_y, num_features, points_per_day) # Combine S_p_day and M into P
+                except Exception as e:
+                    raise RuntimeError(f"Error reshaping predictions from {predictions_segmented.shape} with B={B}, D_y={D_y}, F={num_features}, S={segments_per_day}, M={minutes_per_segment}. Error: {e}") from e
+                # --- End Reshape predictions --- 
+                
+                # Calculate absolute error (shapes are now compatible: (B, D_y, F, P))
                 abs_error = torch.abs(reshaped_preds - data_y)
                 
                 # Apply mask if available
