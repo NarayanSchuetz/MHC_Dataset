@@ -6,8 +6,8 @@ import pandas as pd
 from typing import Dict, Tuple, Optional, List, Union
 from models.revin import RevIN
 from torch.utils.data import DataLoader
-from src.torch_dataset import ForecastingEvaluationDataset
-from src.utils import ForecastSplit, CommonSplits
+from torch_dataset import ForecastingEvaluationDataset
+from utils import ForecastSplit, CommonSplits
 
 
 class AutoencoderLSTM(nn.Module):
