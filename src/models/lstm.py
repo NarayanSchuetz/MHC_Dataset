@@ -2,8 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
 from typing import Dict, Tuple, Optional, List, Union
 from models.revin import RevIN
+from torch.utils.data import DataLoader
+from src.torch_dataset import ForecastingEvaluationDataset
+from src.utils import ForecastSplit, CommonSplits
 
 
 class AutoencoderLSTM(nn.Module):
@@ -337,6 +341,270 @@ class AutoencoderLSTM(nn.Module):
 
             # Stack all predictions
             return torch.cat(future_predictions, dim=1) # Shape: (B, steps, features_per_segment)
+
+    def evaluate_forecast(
+        self,
+        dataframe: pd.DataFrame,
+        root_dir: str,
+        split: Union[str, 'ForecastSplit'] = CommonSplits.FIVE_TO_TWO,
+        batch_size: int = 16,
+        include_mask: bool = True,
+        feature_indices: Optional[List[int]] = None,
+        feature_stats: Optional[Dict] = None,
+        device: Optional[torch.device] = None
+    ) -> Dict:
+        """
+        Evaluate forecasting performance of the model.
+        
+        Args:
+            dataframe: DataFrame with MHC dataset metadata
+            root_dir: Root directory for data files
+            split: Either a ForecastSplit instance or string like "5-2d"
+            batch_size: Batch size for evaluation
+            include_mask: Whether to include masks (required for proper evaluation)
+            feature_indices: Optional list of feature indices to select
+            feature_stats: Optional dictionary for feature standardization
+            device: Device to run evaluation on. If None, uses model's current device.
+        
+        Returns:
+            Dictionary with MAE metrics per channel and overall
+        """
+        if device is None:
+            device = next(self.parameters()).device
+        
+        # Convert string to ForecastSplit if needed
+        if isinstance(split, str):
+            split = ForecastSplit.from_string(split)
+        
+        # Create the forecast dataset
+        forecast_dataset = ForecastingEvaluationDataset(
+            dataframe=dataframe,
+            root_dir=root_dir,
+            sequence_len=split.sequence_len,
+            prediction_horizon=split.prediction_horizon,
+            overlap=split.overlap,
+            include_mask=include_mask,
+            feature_indices=feature_indices,
+            feature_stats=feature_stats
+        )
+        
+        # Create data loader
+        dataloader = DataLoader(
+            forecast_dataset,
+            batch_size=batch_size,
+            shuffle=False  # Don't shuffle for evaluation
+        )
+        
+        # Ensure model is in evaluation mode
+        self.eval()
+        
+        # Initialize metrics
+        all_errors = []
+        all_masks = []
+        
+        # Track per-channel errors
+        num_features = len(feature_indices) if feature_indices is not None else 24
+        channel_errors = [[] for _ in range(num_features)]
+        channel_masks = [[] for _ in range(num_features)]
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                # Move data to device
+                data_x = batch['data_x'].to(device)
+                data_y = batch['data_y'].to(device)
+                
+                # Get the mask if available
+                mask_y = batch.get('mask_y')
+                if mask_y is not None:
+                    mask_y = mask_y.to(device)
+                
+                # Reshape data for prediction
+                batch_size, num_days, num_features, time_steps_x = data_x.shape
+                
+                # Reshape to [B, num_days*segments_per_day, num_features*minutes_per_segment]
+                # For the LSTM model's input format
+                segments_per_day = self.segments_per_day
+                minutes_per_segment = self.minutes_per_segment
+                
+                # Calculate how many segments we have in the input
+                input_segments = (num_days * time_steps_x) // (minutes_per_segment)
+                
+                # Reshape data_x to match model's expected input shape for segments
+                reshaped_data_x = data_x.view(batch_size, num_days, num_features, input_segments, minutes_per_segment)
+                reshaped_data_x = reshaped_data_x.permute(0, 1, 3, 2, 4)  # -> [B, num_days, segments, num_features, minutes_per_segment]
+                reshaped_data_x = reshaped_data_x.reshape(batch_size, input_segments, num_features * minutes_per_segment)
+                
+                # Calculate how many segments we need to predict
+                # Convert prediction_horizon (in minutes) to number of segments
+                target_segments = split.prediction_horizon // minutes_per_segment
+                
+                # Generate predictions
+                predictions = self.predict_future(reshaped_data_x, steps=target_segments)
+                
+                # Reshape predictions to match data_y shape for comparison
+                # Predictions shape: [B, target_segments, num_features*minutes_per_segment]
+                pred_days = target_segments // segments_per_day
+                reshaped_preds = predictions.view(batch_size, target_segments, num_features, minutes_per_segment)
+                reshaped_preds = reshaped_preds.permute(0, 1, 3, 2)  # -> [B, target_segments, minutes_per_segment, num_features]
+                reshaped_preds = reshaped_preds.reshape(batch_size, pred_days, num_features, split.prediction_horizon)
+                
+                # Calculate absolute error
+                abs_error = torch.abs(reshaped_preds - data_y)
+                
+                # Apply mask if available
+                if mask_y is not None:
+                    # For calculating overall MAE
+                    masked_abs_error = abs_error * mask_y
+                    valid_mask = (mask_y > 0)
+                    
+                    # For per-channel MAE
+                    for f in range(num_features):
+                        channel_error = abs_error[:, :, f, :]
+                        channel_mask = mask_y[:, :, f, :]
+                        
+                        # Check if we have any observed values for this channel
+                        if torch.any(channel_mask > 0):
+                            masked_channel_error = channel_error * channel_mask
+                            channel_errors[f].append(masked_channel_error.cpu().numpy())
+                            channel_masks[f].append(channel_mask.cpu().numpy())
+                    
+                    # Add to overall metrics
+                    all_errors.append(masked_abs_error.cpu().numpy())
+                    all_masks.append(valid_mask.cpu().numpy())
+                else:
+                    # Without a mask, use all data
+                    for f in range(num_features):
+                        channel_error = abs_error[:, :, f, :]
+                        channel_errors[f].append(channel_error.cpu().numpy())
+                    
+                    all_errors.append(abs_error.cpu().numpy())
+        
+        # Calculate metrics
+        results = {}
+        
+        # Overall MAE
+        if all_masks:
+            # If masks were used
+            all_errors_array = np.concatenate(all_errors, axis=0)
+            all_masks_array = np.concatenate(all_masks, axis=0)
+            
+            # Calculate MAE only over observed values
+            mask_sum = np.sum(all_masks_array)
+            if mask_sum > 0:
+                overall_mae = np.sum(all_errors_array) / mask_sum
+            else:
+                overall_mae = np.nan
+        else:
+            # If no masks were used
+            all_errors_array = np.concatenate(all_errors, axis=0)
+            overall_mae = np.mean(all_errors_array)
+        
+        results['overall_mae'] = float(overall_mae)
+        
+        # Per-channel MAE
+        channel_maes = []
+        for f in range(num_features):
+            if channel_masks and len(channel_masks[f]) > 0:
+                # With masks
+                try:
+                    channel_errors_array = np.concatenate(channel_errors[f], axis=0)
+                    channel_masks_array = np.concatenate(channel_masks[f], axis=0)
+                    
+                    mask_sum = np.sum(channel_masks_array)
+                    if mask_sum > 0:
+                        channel_mae = np.sum(channel_errors_array) / mask_sum
+                    else:
+                        channel_mae = np.nan
+                except ValueError:
+                    # Handle case where no data was available for this channel
+                    channel_mae = np.nan
+            elif len(channel_errors[f]) > 0:
+                # Without masks
+                channel_errors_array = np.concatenate(channel_errors[f], axis=0)
+                channel_mae = np.mean(channel_errors_array)
+            else:
+                channel_mae = np.nan
+            
+            channel_maes.append(float(channel_mae))
+        
+        results['channel_mae'] = channel_maes
+        
+        return results
+
+
+def run_forecast_evaluation(
+    model: Union[AutoencoderLSTM, RevInAutoencoderLSTM],
+    dataframe: pd.DataFrame,
+    root_dir: str,
+    split: Union[str, 'ForecastSplit'] = CommonSplits.FIVE_TO_TWO,
+    batch_size: int = 16,
+    include_mask: bool = True,
+    feature_indices: Optional[List[int]] = None,
+    feature_names: Optional[List[str]] = None,
+    feature_stats: Optional[Dict] = None,
+    device: Optional[torch.device] = None
+) -> Dict:
+    """
+    Run forecast evaluation and print formatted results.
+    
+    Args:
+        model: The LSTM model to evaluate
+        dataframe: DataFrame with MHC dataset metadata
+        root_dir: Root directory for data files
+        split: Either a ForecastSplit instance or string like "5-2d"
+        batch_size: Batch size for evaluation
+        include_mask: Whether to include masks
+        feature_indices: Optional list of feature indices to select
+        feature_names: Optional list of feature names for reporting
+        feature_stats: Optional dictionary for feature standardization
+        device: Device to run evaluation on. If None, uses model's current device.
+    
+    Returns:
+        Dictionary with evaluation results
+    """
+    # Convert string to ForecastSplit if needed
+    if isinstance(split, str):
+        split = ForecastSplit.from_string(split)
+    
+    print(f"Running forecast evaluation with split: {split}")
+    
+    # Run evaluation
+    results = model.evaluate_forecast(
+        dataframe=dataframe,
+        root_dir=root_dir,
+        split=split,
+        batch_size=batch_size,
+        include_mask=include_mask,
+        feature_indices=feature_indices,
+        feature_stats=feature_stats,
+        device=device
+    )
+    
+    # Print overall results
+    print(f"\nOverall MAE: {results['overall_mae']:.4f}")
+    
+    # Print per-channel results
+    print("\nPer-Channel MAE:")
+    channel_maes = results['channel_mae']
+    
+    # Use feature names if provided, otherwise use indices
+    if feature_names and len(feature_names) == len(channel_maes):
+        feature_labels = feature_names
+    elif feature_indices and len(feature_indices) == len(channel_maes):
+        feature_labels = [f"Feature {i}" for i in feature_indices]
+    else:
+        feature_labels = [f"Feature {i}" for i in range(len(channel_maes))]
+    
+    # Print table header
+    print(f"{'Feature':<20} {'MAE':<10}")
+    print("-" * 30)
+    
+    # Print each channel's MAE
+    for label, mae in zip(feature_labels, channel_maes):
+        mae_str = f"{mae:.4f}" if not np.isnan(mae) else "NaN"
+        print(f"{label:<20} {mae_str:<10}")
+    
+    return results
 
 
 # New class incorporating RevIN applied to original time series features
@@ -755,7 +1023,10 @@ class LSTMTrainer:
                 
         return total_loss / len(dataloader)
     
+
+
     
+
 
 def load_checkpoint(
     checkpoint_path: str, 

@@ -1,5 +1,7 @@
 import pandas as pd
 from constants import HKQuantityType
+from dataclasses import dataclass
+from typing import List, Union
 
 def convert_to_local_time(df, offset_column="startTime_timezone_offset"):
     """
@@ -171,3 +173,83 @@ def load_data(base_path: str, user_id: str, file_type: str) -> pd.DataFrame:
     except Exception as e:
         print(f"Error loading file at {file_path}: {e}")
         return pd.DataFrame(columns=['source', 'healthCode'], index=pd.DatetimeIndex([]))
+
+
+@dataclass
+class ForecastSplit:
+    """Represents a forecast split configuration."""
+    input_days: int
+    forecast_days: int
+    overlap: int = 0
+    
+    @property
+    def sequence_len(self) -> int:
+        """Get sequence length in minutes."""
+        return self.input_days * 24 * 60
+    
+    @property
+    def prediction_horizon(self) -> int:
+        """Get prediction horizon in minutes."""
+        return self.forecast_days * 24 * 60
+    
+    @classmethod
+    def from_string(cls, split_str: str) -> 'ForecastSplit':
+        """
+        Create a ForecastSplit from a string like "5-2d".
+        
+        Args:
+            split_str: String in format "X-Yd" where X is input days, Y is forecast days
+                      e.g., "5-2d" means 5 days of input, 2 days of forecast
+        
+        Returns:
+            ForecastSplit instance
+        """
+        parts = split_str.split('-')
+        if len(parts) != 2:
+            raise ValueError(f"Invalid split format: {split_str}. Expected format like '5-2d'")
+        
+        try:
+            input_days = int(parts[0])
+            forecast_part = parts[1]
+            if not forecast_part.endswith('d'):
+                raise ValueError(f"Invalid forecast format: {forecast_part}. Expected format like '2d'")
+            
+            forecast_days = int(forecast_part[:-1])
+            
+            return cls(input_days=input_days, forecast_days=forecast_days)
+        except ValueError as e:
+            raise ValueError(f"Error parsing split string '{split_str}': {str(e)}")
+    
+    def __str__(self) -> str:
+        """Convert to string representation."""
+        return f"{self.input_days}-{self.forecast_days}d"
+    
+    def __eq__(self, other: object) -> bool:
+        """Compare with another ForecastSplit or string."""
+        if isinstance(other, str):
+            try:
+                other = ForecastSplit.from_string(other)
+            except ValueError:
+                return False
+        if not isinstance(other, ForecastSplit):
+            return False
+        return (self.input_days == other.input_days and 
+                self.forecast_days == other.forecast_days and 
+                self.overlap == other.overlap)
+
+
+class CommonSplits:
+    """Commonly used forecast splits."""
+    FIVE_TO_TWO = ForecastSplit(5, 2)
+    SEVEN_TO_THREE = ForecastSplit(7, 3)
+    TEN_TO_FIVE = ForecastSplit(10, 5)
+    
+    @classmethod
+    def get_all(cls) -> List[ForecastSplit]:
+        """Get all common splits."""
+        return [cls.FIVE_TO_TWO, cls.SEVEN_TO_THREE, cls.TEN_TO_FIVE]
+    
+    @classmethod
+    def get_names(cls) -> List[str]:
+        """Get string names of all common splits."""
+        return [str(split) for split in cls.get_all()]
