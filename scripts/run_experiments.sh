@@ -25,7 +25,7 @@ python3 scripts/lstm_experiment.py \
   --wandb_entity schuetzn \
   --use_revin \
   --batch_size 128 \
-  --num_epochs 200 \
+  --num_epochs 100 \
   --lr 0.0001 \
   --hidden_size 256 \
   --encoding_dim 256 \
@@ -34,9 +34,11 @@ python3 scripts/lstm_experiment.py \
   --prediction_horizon 1 \
   --num_features 6 \
   --initial_tf 1.0 \
-  --final_tf 0.3 \
-  --decay_epochs 150 \
+  --final_tf 1.0 \
+  --decay_epochs 100 \
   --save_model \
   --checkpoint_dir /scratch/users/schuetzn/data/mhc_dataset_out/lstm \
   --num_workers 16 \
-  --run_name "revin_experiment_$(date +%Y%m%d_%H%M%S)"
+  --dataset_path /scratch/users/schuetzn/data/mhc_dataset_out/splits/train_dataset.parquet \
+  --val_dataset_path /scratch/users/schuetzn/data/mhc_dataset_out/splits/val_dataset.parquet \
+  --run_name "revin_experiment_tf=1_$(date +%Y%m%d_%H%M%S)"

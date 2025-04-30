@@ -19,8 +19,11 @@ def parse_args():
     
     # Data paths
     parser.add_argument('--dataset_path', type=str, 
-                        default="/scratch/users/schuetzn/data/mhc_dataset_out/splits/train_with_val_dataset.parquet",
-                        help='Path to the dataset parquet file')
+                        default="/scratch/users/schuetzn/data/mhc_dataset_out/splits/train_dataset.parquet",
+                        help='Path to the training dataset parquet file')
+    parser.add_argument('--val_dataset_path', type=str, 
+                        default="/scratch/users/schuetzn/data/mhc_dataset_out/splits/val_dataset.parquet",
+                        help='Path to the validation dataset parquet file')
     parser.add_argument('--root_dir', type=str, 
                         default="/scratch/groups/euan/mhc/mhc_dataset",
                         help='Root directory containing the MHC dataset')
@@ -49,7 +52,7 @@ def parse_args():
     # Teacher forcing parameters
     parser.add_argument('--initial_tf', type=float, default=1.0, 
                         help='Initial teacher forcing ratio')
-    parser.add_argument('--final_tf', type=float, default=0.0, 
+    parser.add_argument('--final_tf', type=float, default=1.0, 
                         help='Final teacher forcing ratio')
     parser.add_argument('--decay_epochs', type=int, default=15, 
                         help='Number of epochs to decay teacher forcing')
@@ -137,7 +140,8 @@ def main():
         config=vars(args)
     )
     
-    print(f"Loading dataset from {args.dataset_path}")
+    print(f"Loading training dataset from {args.dataset_path}")
+    print(f"Loading validation dataset from {args.val_dataset_path}")
     print(f"Using root directory: {args.root_dir}")
     
     # Load standardization parameters
@@ -146,29 +150,38 @@ def main():
     for f_idx, row in standardization_df.iloc[:args.num_features].iterrows():
         scaler_stats[f_idx] = (row["mean"], row["std_dev"])
     
-    # Load the dataset from parquet
-    df = pd.read_parquet(args.dataset_path)
-    df["file_uris"] = df["file_uris"].apply(eval)
-    print(f"Loaded dataset with {len(df)} samples")
+    # Load the training dataset from parquet
+    train_df = pd.read_parquet(args.dataset_path)
+    train_df["file_uris"] = train_df["file_uris"].apply(eval)
+    print(f"Loaded training dataset with {len(train_df)} samples")
+    
+    # Load the validation dataset from parquet
+    val_df = pd.read_parquet(args.val_dataset_path)
+    val_df["file_uris"] = val_df["file_uris"].apply(eval)
+    print(f"Loaded validation dataset with {len(val_df)} samples")
     
     # Print available label columns
-    label_cols = [col for col in df.columns if col.endswith('_value')]
+    label_cols = [col for col in train_df.columns if col.endswith('_value')]
     print(f"Available label columns: {label_cols}")
     
-    # Create the dataset with mask
-    dataset = BaseMhcDataset(
-        df, 
+    # Create the datasets with mask
+    train_dataset = BaseMhcDataset(
+        train_df, 
         args.root_dir, 
         include_mask=True, 
         feature_stats=scaler_stats, 
         feature_indices=list(range(args.num_features))
     )
     
-    # Split into train and validation sets (80% train, 20% validation)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    print(f"Split dataset into {train_size} training and {val_size} validation samples")
+    val_dataset = BaseMhcDataset(
+        val_df, 
+        args.root_dir, 
+        include_mask=True, 
+        feature_stats=scaler_stats, 
+        feature_indices=list(range(args.num_features))
+    )
+    
+    print(f"Created datasets with {len(train_dataset)} training and {len(val_dataset)} validation samples")
     
     # Create data loaders
     train_loader = DataLoader(
