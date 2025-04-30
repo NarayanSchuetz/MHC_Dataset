@@ -6,7 +6,7 @@ import pandas as pd
 from typing import Dict, Tuple, Optional, List, Union
 from models.revin import RevIN
 from torch.utils.data import DataLoader
-from torch_dataset import ForecastingEvaluationDataset
+from torch_dataset import FlattenedForecastingDataset
 from utils import ForecastSplit, CommonSplits
 
 
@@ -69,6 +69,7 @@ class AutoencoderLSTM(nn.Module):
         # Constants for data structure
         self.minutes_per_segment = 30
         self.segments_per_day = (24 * 60) // self.minutes_per_segment  # 48 segments per day
+        self.time_points = 24 * 60  # 1440 minutes per day, used in evaluate_forecast
         # features_per_segment is based on the original number of features
         self.features_per_segment = self.num_original_features * self.minutes_per_segment # e.g., 24*30 = 720
         
@@ -101,11 +102,13 @@ class AutoencoderLSTM(nn.Module):
         
     def preprocess_batch(self, batch_data: torch.Tensor, batch_mask: Optional[torch.Tensor] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Preprocess batch data from shape (batch_size, num_days, num_original_features, 1440)
+        Preprocess batch data from either:
+        1. Original shape (batch_size, num_days, num_original_features, 1440)
+        2. Flattened shape (batch_size, num_original_features, num_days * 1440)
         to 30-minute segments suitable for encoding.
 
         Args:
-            batch_data: Input tensor of shape (batch_size, num_days, num_original_features, 1440)
+            batch_data: Input tensor of either shape above
             batch_mask: Optional mask tensor of same shape
 
         Returns:
@@ -114,34 +117,78 @@ class AutoencoderLSTM(nn.Module):
             Else:
                 Tuple of (processed_data, processed_mask) both of shape (batch_size, num_segments, features_per_segment)
         """
-        batch_size, num_days, features, minutes_per_day = batch_data.shape
+        # Determine input format based on tensor shape
+        if len(batch_data.shape) == 4:
+            # Original shape: (batch_size, num_days, num_original_features, 1440)
+            batch_size, num_days, features, minutes_per_day = batch_data.shape
 
-        # Verify features match expectation
-        if features != self.num_original_features:
-             raise ValueError(f"Expected {self.num_original_features} features per minute, got {features}")
-        if minutes_per_day != 24 * 60:
-            raise ValueError(f"Expected 1440 minutes per day, got {minutes_per_day}")
+            # Verify features match expectation
+            if features != self.num_original_features:
+                raise ValueError(f"Expected {self.num_original_features} features per minute, got {features}")
+            if minutes_per_day != 24 * 60:
+                raise ValueError(f"Expected 1440 minutes per day, got {minutes_per_day}")
 
-        segments_per_day = minutes_per_day // self.minutes_per_segment # Should be 48
-        num_segments = num_days * segments_per_day
+            segments_per_day = minutes_per_day // self.minutes_per_segment # Should be 48
+            num_segments = num_days * segments_per_day
 
-        # Reshape to create 30-minute segments
-        # From (B, D, F, M) to (B, D * S, F * MinPerSeg) = (B, num_segments, features_per_segment)
-        x = batch_data.view(batch_size, num_days, features, segments_per_day, self.minutes_per_segment)
-        x = x.permute(0, 1, 3, 2, 4) # -> (B, D, S, F, MinPerSeg)
-        x = x.reshape(batch_size, num_segments, features * self.minutes_per_segment) # -> (B, num_segments, features_per_segment)
+            # Reshape to create 30-minute segments
+            # From (B, D, F, M) to (B, D * S, F * MinPerSeg) = (B, num_segments, features_per_segment)
+            x = batch_data.view(batch_size, num_days, features, segments_per_day, self.minutes_per_segment)
+            x = x.permute(0, 1, 3, 2, 4) # -> (B, D, S, F, MinPerSeg)
+            x = x.reshape(batch_size, num_segments, features * self.minutes_per_segment) # -> (B, num_segments, features_per_segment)
 
-        # Replace NaN values with zeros in data
-        x = torch.nan_to_num(x, nan=0.0)
+            # Replace NaN values with zeros in data
+            x = torch.nan_to_num(x, nan=0.0)
 
-        if batch_mask is not None:
-            # Reshape mask similarly
-            mask = batch_mask.view(batch_size, num_days, features, segments_per_day, self.minutes_per_segment)
-            mask = mask.permute(0, 1, 3, 2, 4) # -> (B, D, S, F, MinPerSeg)
-            mask = mask.reshape(batch_size, num_segments, features * self.minutes_per_segment) # -> (B, num_segments, features_per_segment)
-            return x, mask
+            if batch_mask is not None:
+                # Reshape mask similarly
+                mask = batch_mask.view(batch_size, num_days, features, segments_per_day, self.minutes_per_segment)
+                mask = mask.permute(0, 1, 3, 2, 4) # -> (B, D, S, F, MinPerSeg)
+                mask = mask.reshape(batch_size, num_segments, features * self.minutes_per_segment) # -> (B, num_segments, features_per_segment)
+                return x, mask
 
-        return x
+            return x
+            
+        elif len(batch_data.shape) == 3:
+            # Flattened shape: (batch_size, num_original_features, num_days * 1440)
+            batch_size, features, total_time_points = batch_data.shape
+            
+            # Verify features match expectation
+            if features != self.num_original_features:
+                raise ValueError(f"Expected {self.num_original_features} features per minute, got {features}")
+                
+            # Calculate how many days we have based on total time points
+            if total_time_points % (24 * 60) != 0:
+                raise ValueError(f"Total time points ({total_time_points}) is not divisible by minutes per day (1440)")
+                
+            num_days = total_time_points // (24 * 60)
+            minutes_per_day = 24 * 60
+            segments_per_day = minutes_per_day // self.minutes_per_segment # Should be 48
+            num_segments = num_days * segments_per_day
+            
+            # Reshape flattened data to create 30-minute segments
+            # From (B, F, D*M) to (B, F, D, M) to (B, F, D, S, MinPerSeg)
+            x = batch_data.view(batch_size, features, num_days, minutes_per_day)
+            x = x.view(batch_size, features, num_days, segments_per_day, self.minutes_per_segment)
+            # Permute to (B, D, S, F, MinPerSeg)
+            x = x.permute(0, 2, 3, 1, 4)
+            # Reshape to (B, D*S, F*MinPerSeg) = (B, num_segments, features_per_segment)
+            x = x.reshape(batch_size, num_segments, features * self.minutes_per_segment)
+            
+            # Replace NaN values with zeros
+            x = torch.nan_to_num(x, nan=0.0)
+            
+            if batch_mask is not None:
+                # Reshape mask similarly
+                mask = batch_mask.view(batch_size, features, num_days, minutes_per_day)
+                mask = mask.view(batch_size, features, num_days, segments_per_day, self.minutes_per_segment)
+                mask = mask.permute(0, 2, 3, 1, 4)
+                mask = mask.reshape(batch_size, num_segments, features * self.minutes_per_segment)
+                return x, mask
+                
+            return x
+        else:
+            raise ValueError(f"Unexpected input shape: {batch_data.shape}. Expected either (B, D, F, M) or (B, F, D*M)")
             
     def forward(self, batch: Dict[str, Union[torch.Tensor, Dict]], return_predictions: bool = True) -> Dict[str, torch.Tensor]:
         """
@@ -305,9 +352,28 @@ class AutoencoderLSTM(nn.Module):
         """
         Predict future time steps given an input sequence.
         Assumes input_sequence is already segmented (batch_size, num_segments, features_per_segment).
-        Base implementation without RevIN.
+        If input_sequence is flattened format (batch_size, num_features, time_points), it's
+        preprocessed to convert to the segmented format.
+        
+        Args:
+            input_sequence: Input sequence in segmented format (B, S, F*M) or
+                            flattened format (B, F, T)
+            steps: Number of future steps to predict
+            
+        Returns:
+            torch.Tensor: Predicted future segments (B, steps, F*M)
         """
         self.eval()
+        
+        # Check if input is already in segmented format or needs preprocessing
+        if len(input_sequence.shape) == 3:
+            batch_size, dim1, dim2 = input_sequence.shape
+            
+            # If dim1 < dim2 and dim1 == num_features, it's likely in flattened format (B, F, T)
+            if dim1 < dim2 and dim1 == self.num_original_features:
+                # Input is in flattened format (B, F, T), preprocess it
+                input_sequence = self.preprocess_batch(input_sequence)
+        
         batch_size = input_sequence.shape[0]
         
         with torch.no_grad():
@@ -320,7 +386,6 @@ class AutoencoderLSTM(nn.Module):
             lstm_out, (h, c) = self.lstm(encoded) # Get final state from full sequence
 
             # Use the last segment's output for the first prediction step input
-            # Or maybe just use the last segment of the input directly? Let's use the last segment
             # The prediction loop needs an input of shape (B, 1, features_per_segment)
             last_segment_input = current_input[:, -1:, :] # Shape: (B, 1, features_per_segment)
 
@@ -354,7 +419,7 @@ class AutoencoderLSTM(nn.Module):
         device: Optional[torch.device] = None
     ) -> Dict:
         """
-        Evaluate forecasting performance of the model.
+        Evaluate forecasting performance of the model using flattened data.
         
         Args:
             dataframe: DataFrame with MHC dataset metadata
@@ -376,8 +441,8 @@ class AutoencoderLSTM(nn.Module):
         if isinstance(split, str):
             split = ForecastSplit.from_string(split)
         
-        # Create the forecast dataset
-        forecast_dataset = ForecastingEvaluationDataset(
+        # Create the flattened forecast dataset
+        forecast_dataset = FlattenedForecastingDataset(
             dataframe=dataframe,
             root_dir=root_dir,
             sequence_len=split.sequence_len,
@@ -403,78 +468,51 @@ class AutoencoderLSTM(nn.Module):
         all_masks = []
         
         # Track per-channel errors
-        num_features = len(feature_indices) if feature_indices is not None else 24
+        num_features = len(feature_indices) if feature_indices is not None else self.num_original_features
         channel_errors = [[] for _ in range(num_features)]
         channel_masks = [[] for _ in range(num_features)]
         
         with torch.no_grad():
             for batch in dataloader:
                 # Move data to device
-                data_x = batch['data_x'].to(device)
-                data_y = batch['data_y'].to(device)
+                data_x = batch['data_x'].to(device)  # Shape: (B, F, sequence_len)
+                data_y = batch['data_y'].to(device)  # Shape: (B, F, prediction_horizon)
                 
                 # Get the mask if available
                 mask_y = batch.get('mask_y')
                 if mask_y is not None:
                     mask_y = mask_y.to(device)
                 
-                # Get input dimensions (Batch, Days, Features, Points_per_day)
-                B, D_x, F_x, P_x = data_x.shape 
-                # Get target dimensions (Batch, Days, Features, Points_per_day) - should match F, P
-                _, D_y, F_y, P_y = data_y.shape
-
-                if F_x != F_y or P_x != P_y or P_x != self.time_points:
-                    logger.warning(f"Shape mismatch or unexpected time points. data_x: {data_x.shape}, data_y: {data_y.shape}, expected points: {self.time_points}")
-                    # Handle error or proceed with caution - let's use F_x and P_x
-                    num_features = F_x
-                    points_per_day = P_x
-                else:
-                    num_features = F_x
-                    points_per_day = P_x
-
-                # Define segmentation parameters
-                segments_per_day = points_per_day // self.minutes_per_segment
-                minutes_per_segment = self.minutes_per_segment
-                features_per_segment = num_features * minutes_per_segment
-
-                # --- Correct Reshape data_x for predict_future --- 
-                # Input: (B, D_x, F, P) 
-                # Output needed: (B, num_input_segments, features_per_segment)
-                num_input_segments = D_x * segments_per_day
-                
-                # Reshape: (B, D_x, F, P) -> (B, D_x, F, S_p_day, M) -> (B, D_x, S_p_day, F, M) -> (B, D_x*S_p_day, F*M)
-                try:
-                    reshaped_data_x = data_x.view(B, D_x, num_features, segments_per_day, minutes_per_segment)
-                    reshaped_data_x = reshaped_data_x.permute(0, 1, 3, 2, 4) # -> (B, D_x, S, F, M)
-                    reshaped_data_x = reshaped_data_x.reshape(B, num_input_segments, features_per_segment) 
-                except Exception as e:
-                    raise RuntimeError(f"Error reshaping data_x from {data_x.shape} with B={B}, D_x={D_x}, F={num_features}, S={segments_per_day}, M={minutes_per_segment}. Error: {e}") from e
-                # --- End Reshape data_x ---
-                
-                # Calculate how many segments we need to predict
-                # Prediction horizon comes from data_y's day dimension D_y
-                target_segments = D_y * segments_per_day 
+                # Get dimensions from flattened data
+                B, F, sequence_len = data_x.shape
+                _, _, prediction_horizon = data_y.shape
                 
                 # Generate predictions using the model's prediction method
-                # predict_future expects (B, S_in, F_seg) and returns (B, S_pred, F_seg)
-                predictions_segmented = self.predict_future(reshaped_data_x, steps=target_segments)
+                # Input to predict_future should be (B, F, sequence_len) 
+                # No need to permute as our preprocess_batch will handle flattened input
                 
-                # --- Reshape predictions to match data_y shape --- 
-                # Input: (B, S_pred, F_seg) where S_pred = target_segments = D_y * segments_per_day
-                # Output needed: (B, D_y, F, P) 
+                # Generate predictions - the predict_future method will internally
+                # preprocess the flattened data
+                predictions_segmented = self.predict_future(data_x, steps=prediction_horizon // self.minutes_per_segment)
                 
-                # Reshape: (B, S_pred, F * M) -> (B, S_pred, F, M) -> (B, D_y, S_p_day, F, M) -> (B, D_y, F, S_p_day, M) -> (B, D_y, F, P)
-                try:
-                    reshaped_preds = predictions_segmented.view(B, target_segments, num_features, minutes_per_segment)
-                    reshaped_preds = reshaped_preds.view(B, D_y, segments_per_day, num_features, minutes_per_segment) # Split S_pred into D_y and S_p_day
-                    reshaped_preds = reshaped_preds.permute(0, 1, 3, 2, 4) # -> (B, D_y, F, S_p_day, M)
-                    reshaped_preds = reshaped_preds.reshape(B, D_y, num_features, points_per_day) # Combine S_p_day and M into P
-                except Exception as e:
-                    raise RuntimeError(f"Error reshaping predictions from {predictions_segmented.shape} with B={B}, D_y={D_y}, F={num_features}, S={segments_per_day}, M={minutes_per_segment}. Error: {e}") from e
-                # --- End Reshape predictions --- 
+                # Reshape predictions to match data_y's flattened shape (B, F, prediction_horizon)
+                # First get the number of segments we predicted
+                B_pred, num_steps, features_per_segment = predictions_segmented.shape
                 
-                # Calculate absolute error (shapes are now compatible: (B, D_y, F, P))
-                abs_error = torch.abs(reshaped_preds - data_y)
+                # Reshape to get features separated
+                # (B, steps, F*M) -> (B, steps, F, M)
+                reshaped_preds = predictions_segmented.reshape(B_pred, num_steps, self.num_original_features, self.minutes_per_segment)
+                
+                # Permute and reshape to flattened format (B, F, T)
+                # (B, steps, F, M) -> (B, F, steps*M)
+                final_preds = reshaped_preds.permute(0, 2, 1, 3).reshape(B_pred, self.num_original_features, num_steps * self.minutes_per_segment)
+                
+                # Verify shapes match
+                if final_preds.shape[2] != data_y.shape[2]:
+                    raise ValueError(f"Prediction shape {final_preds.shape} doesn't match target shape {data_y.shape}")
+                
+                # Calculate absolute error (shapes are now compatible)
+                abs_error = torch.abs(final_preds - data_y)
                 
                 # Apply mask if available
                 if mask_y is not None:
@@ -484,8 +522,8 @@ class AutoencoderLSTM(nn.Module):
                     
                     # For per-channel MAE
                     for f in range(num_features):
-                        channel_error = abs_error[:, :, f, :]
-                        channel_mask = mask_y[:, :, f, :]
+                        channel_error = abs_error[:, f, :]
+                        channel_mask = mask_y[:, f, :]
                         
                         # Check if we have any observed values for this channel
                         if torch.any(channel_mask > 0):
@@ -499,7 +537,7 @@ class AutoencoderLSTM(nn.Module):
                 else:
                     # Without a mask, use all data
                     for f in range(num_features):
-                        channel_error = abs_error[:, :, f, :]
+                        channel_error = abs_error[:, f, :]
                         channel_errors[f].append(channel_error.cpu().numpy())
                     
                     all_errors.append(abs_error.cpu().numpy())
@@ -620,16 +658,38 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
     def forward(self, batch: Dict[str, Union[torch.Tensor, Dict]], return_predictions: bool = True) -> Dict[str, torch.Tensor]:
         """
         Forward pass with conditional RevIN based on feature variance.
+        Handles both original shape (B, D, F, M) and flattened shape (B, F, D*M)
         """
         x_orig = batch['data']
         mask_orig = batch.get('mask') if self.use_masked_loss else None
-        batch_size, num_days, _, minutes_per_day = x_orig.shape
-        time_steps = num_days * minutes_per_day
+        
+        # Determine input format based on tensor shape
+        if len(x_orig.shape) == 4:
+            # Original shape: (batch_size, num_days, num_original_features, 1440)
+            batch_size, num_days, features, minutes_per_day = x_orig.shape
+            time_steps = num_days * minutes_per_day
 
-        # --- Reshape and Clean Input ---
-        # Reshape: (B, D, F, M) -> (B, T, F)
-        x_reshaped = x_orig.permute(0, 2, 1, 3).reshape(batch_size, self.num_original_features, time_steps)
-        x_reshaped = x_reshaped.permute(0, 2, 1)
+            # --- Reshape and Clean Input ---
+            # Reshape: (B, D, F, M) -> (B, T, F)
+            x_reshaped = x_orig.permute(0, 2, 1, 3).reshape(batch_size, self.num_original_features, time_steps)
+            x_reshaped = x_reshaped.permute(0, 2, 1)
+        
+        elif len(x_orig.shape) == 3:
+            # Flattened shape: (batch_size, num_original_features, num_days * 1440)
+            batch_size, features, time_steps = x_orig.shape
+            
+            # Already in the right shape for RevIN, just permute
+            # From (B, F, T) to (B, T, F)
+            x_reshaped = x_orig.permute(0, 2, 1)
+            
+            # Calculate num_days for later use
+            minutes_per_day = 24 * 60
+            if time_steps % minutes_per_day != 0:
+                raise ValueError(f"Total time points ({time_steps}) is not divisible by minutes per day (1440)")
+            num_days = time_steps // minutes_per_day
+        
+        else:
+            raise ValueError(f"Unexpected input shape: {x_orig.shape}. Expected either (B, D, F, M) or (B, F, D*M)")
 
         # Handle NaNs before variance check
         x_clean = torch.nan_to_num(x_reshaped, nan=0.0)
@@ -649,9 +709,14 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
         # Use the mask to select between original cleaned data and normalized data
         x_normalized_final = torch.where(skip_revin_mask, x_clean, x_normalized_all)
 
-        # Reshape back to (B, D, F, M)
-        x_normalized = x_normalized_final.permute(0, 2, 1).reshape(batch_size, self.num_original_features, num_days, minutes_per_day)
-        x_normalized = x_normalized.permute(0, 2, 1, 3)
+        # Reshape back based on original input format
+        if len(x_orig.shape) == 4:
+            # Original shape: reshape back to (B, D, F, M)
+            x_normalized = x_normalized_final.permute(0, 2, 1).reshape(batch_size, self.num_original_features, num_days, minutes_per_day)
+            x_normalized = x_normalized.permute(0, 2, 1, 3)
+        else:
+            # Flattened shape: reshape back to (B, F, T)
+            x_normalized = x_normalized_final.permute(0, 2, 1)
         # --- End Conditional Normalization ---
 
         # Preprocess normalized data (and original mask) into segments
@@ -662,8 +727,7 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
             mask_segmented = None
 
         # Preprocess original data for targets (handle NaNs)
-        x_orig_processed = torch.nan_to_num(x_orig, nan=0.0)
-        x_orig_segmented = self.preprocess_batch(x_orig_processed)
+        x_orig_segmented = self.preprocess_batch(x_orig)
 
         # Split segments
         input_segments_norm = x_norm_segmented[:, :-self.prediction_horizon, :]
@@ -764,30 +828,110 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
     # 9. Reshape back to segments
     def predict_future(self, input_sequence: torch.Tensor, steps: int = 1) -> torch.Tensor:
         """
-        Predict future time steps with conditional RevIN based on input feature variance.
+        Predict future time steps auto-regressively using the RevIN LSTM model.
+
+        This method handles input sequences in two formats:
+        1. Flattened time series: (batch_size, num_original_features, time_points) - (B, F, T)
+        2. Pre-segmented format: (batch_size, num_segments, features_per_segment) - (B, S, F*M)
+
+        The prediction process involves these key steps:
+        1.  Input Handling: Detects the input format. If flattened, reshapes to (B, T, F).
+            If segmented, reshapes to time series format (B, T, F) where T = S * M.
+        2.  Conditional Normalization:
+            - Calculates the standard deviation for each feature across time for each batch instance.
+            - Creates a mask (`skip_revin_mask`) to identify features with near-zero variance.
+            - Applies RevIN normalization to the time series data (B, T, F).
+            - Uses the `skip_revin_mask` to keep the original (cleaned) values for zero-variance features,
+              resulting in a 'conditionally normalized' time series.
+        3.  Segmentation: Reshapes the conditionally normalized time series back into the
+            segmented format (B, S, F*M) expected by the encoder/LSTM.
+        4.  LSTM State Initialization: Encodes the entire conditionally normalized input sequence
+            and processes it through the LSTM to obtain the final hidden state (`h`, `c`). This
+            state captures the history encoded in the input sequence.
+        5.  Auto-regressive Prediction Loop:
+            - Starts with the last segment of the conditionally normalized input sequence.
+            - Iterates `steps` times:
+                - Encodes the current segment.
+                - Feeds the encoded segment and the current hidden state (`h`, `c`) to the LSTM.
+                - Decodes the LSTM output to get the next predicted segment (still conditionally normalized).
+                - Stores the prediction and uses it as the input for the next iteration.
+        6.  Conditional De-normalization:
+            - Concatenates the predicted segments (which are in the normalized space).
+            - Reshapes the predicted segments back into a time series format (B, pred_T, F).
+            - Applies RevIN de-normalization using the statistics stored during the initial normalization step.
+            - Crucially, uses the *original* `skip_revin_mask` (computed from the input sequence)
+              to ensure that features that were initially skipped during normalization are *not*
+              de-normalized, preserving their values directly from the prediction loop.
+        7.  Output Formatting: Reshapes the final, de-normalized time series predictions back
+            into the segmented format (B, steps, F*M).
+
+        Args:
+            input_sequence: Input sequence tensor in either flattened (B, F, T) or
+                            segmented (B, S, F*M) format.
+            steps: Number of future 30-minute segments to predict.
+
+        Returns:
+            torch.Tensor: Predicted future segments in the original data scale,
+                          with shape (batch_size, steps, features_per_segment).
         """
         self.eval()
-        batch_size = input_sequence.shape[0]
-        num_input_segments = input_sequence.shape[1]
-        input_time_steps = num_input_segments * self.minutes_per_segment
+
+        # Check if input is already in segmented format or needs preprocessing
+        if len(input_sequence.shape) == 3:
+            batch_size, dim1, dim2 = input_sequence.shape
+            
+            # If dim1 < dim2 and dim1 == num_features, it's likely flattened format (B, F, T)
+            # Otherwise, assume it's already segmented (B, S, F*M)
+            is_flattened = dim1 < dim2 and dim1 == self.num_original_features
+            
+            if is_flattened:
+                # Input is in flattened format (B, F, T)
+                batch_size, features, total_time_points = input_sequence.shape
+                input_time_steps = total_time_points
+                
+                # Reshape to (B, T, F) for RevIN
+                input_reshaped = input_sequence.permute(0, 2, 1)
+                input_clean = torch.nan_to_num(input_reshaped, nan=0.0)
+                
+                # Detect zero-variance features
+                stdev = torch.std(input_clean, dim=1, keepdim=True)
+                skip_revin_mask = (stdev < self.rev_in_eps)  # Shape: (B, 1, F) - Crucial mask for later
+                
+                # Apply conditional normalization
+                normalized_input_all = self.rev_in(input_clean, mode='norm')
+                normalized_input_final = torch.where(skip_revin_mask, input_clean, normalized_input_all)
+                
+                # Reshape back to (B, F, T) for preprocessing
+                normalized_input_flattened = normalized_input_final.permute(0, 2, 1)
+                
+                # Preprocess to segmented format
+                normalized_input_segmented = self.preprocess_batch(normalized_input_flattened)
+            else:
+                # Already segmented, handle as in original method
+                batch_size = input_sequence.shape[0]
+                num_input_segments = input_sequence.shape[1]
+                input_time_steps = num_input_segments * self.minutes_per_segment
+                
+                # Reshape for variance detection and normalization
+                input_reshaped = input_sequence.view(batch_size, num_input_segments, self.num_original_features, self.minutes_per_segment)
+                input_reshaped = input_reshaped.permute(0, 1, 3, 2).reshape(batch_size, input_time_steps, self.num_original_features)
+                input_clean = torch.nan_to_num(input_reshaped, nan=0.0)
+                
+                # Detect zero-variance features
+                stdev = torch.std(input_clean, dim=1, keepdim=True)
+                skip_revin_mask = (stdev < self.rev_in_eps)  # Shape: (B, 1, F) - Crucial mask for later
+                
+                # Apply conditional normalization
+                normalized_input_all = self.rev_in(input_clean, mode='norm')
+                normalized_input_final = torch.where(skip_revin_mask, input_clean, normalized_input_all)
+                
+                # Reshape normalized time series back into segments
+                normalized_input_segmented = normalized_input_final.view(batch_size, num_input_segments, self.minutes_per_segment, self.num_original_features)
+                normalized_input_segmented = normalized_input_segmented.permute(0, 1, 3, 2).reshape(batch_size, num_input_segments, self.features_per_segment)
+        else:
+            raise ValueError(f"Unexpected input shape: {input_sequence.shape}. Expected either (B, S, F*M) or (B, F, T)")
 
         with torch.no_grad():
-            # --- Reshape, Clean, Detect Variance ---
-            input_reshaped = input_sequence.view(batch_size, num_input_segments, self.num_original_features, self.minutes_per_segment)
-            input_reshaped = input_reshaped.permute(0, 1, 3, 2).reshape(batch_size, input_time_steps, self.num_original_features)
-            input_clean = torch.nan_to_num(input_reshaped, nan=0.0)
-            stdev = torch.std(input_clean, dim=1, keepdim=True)
-            skip_revin_mask = (stdev < self.rev_in_eps) # Shape: (B, 1, F) - Crucial mask for later
-
-            # --- Conditional Normalization ---
-            normalized_input_all = self.rev_in(input_clean, mode='norm')
-            normalized_input_final = torch.where(skip_revin_mask, input_clean, normalized_input_all)
-
-            # Reshape normalized time series back into segments for LSTM
-            normalized_input_segmented = normalized_input_final.view(batch_size, num_input_segments, self.minutes_per_segment, self.num_original_features)
-            normalized_input_segmented = normalized_input_segmented.permute(0, 1, 3, 2).reshape(batch_size, num_input_segments, self.features_per_segment)
-            # --- End Conditional Normalization ---
-
             # --- Prediction Loop (operates on conditionally normalized segments) ---
             future_predictions_cond_norm = []
             current_cond_norm_input = normalized_input_segmented # Start with the normalized input history
@@ -831,6 +975,7 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
 
             return final_predictions_segmented
         
+
 def run_forecast_evaluation(
     model: Union[AutoencoderLSTM, RevInAutoencoderLSTM],
     dataframe: pd.DataFrame,

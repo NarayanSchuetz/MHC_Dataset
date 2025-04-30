@@ -3,6 +3,7 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple, Union
 from torch.utils.data import DataLoader
 import pandas as pd
+import torch.nn.functional as F # Added for mse_loss
 
 from torch_dataset import ForecastingEvaluationDataset
 from models.lstm import AutoencoderLSTM, RevInAutoencoderLSTM
@@ -44,6 +45,247 @@ def parse_forecast_split(split_str: str) -> Tuple[int, int, int]:
         raise ValueError(f"Error parsing split string '{split_str}': {str(e)}")
 
 
+def _predict_batch(
+    model: Union[AutoencoderLSTM, RevInAutoencoderLSTM],
+    data_x: torch.Tensor,
+    data_y: torch.Tensor,
+    prediction_horizon: int,
+    device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Handles reshaping and prediction for a single batch.
+
+    Args:
+        model: The forecasting model.
+        data_x: Input data tensor [B, D_in, F, T_x].
+        data_y: Target data tensor [B, D_out, F, T_pred].
+        prediction_horizon: Total prediction horizon in minutes.
+        device: Device to run on.
+
+    Returns:
+        Tuple of (reshaped_predictions, data_y, valid_mask_elements).
+        Returns (None, data_y, None) if reshaping or prediction fails.
+    """
+    # --- Reshape input data for prediction ---
+    batch_size, num_days_in, _, time_steps_x = data_x.shape
+    _, _, num_features, time_steps_y = data_y.shape # Infer num_features from data_y
+
+    # Get model parameters
+    segments_per_day = model.segments_per_day
+    minutes_per_segment = model.minutes_per_segment
+
+    # Check consistency for input
+    if time_steps_x != segments_per_day * minutes_per_segment:
+         segments_per_day = time_steps_x // minutes_per_segment # Adjust based on data
+
+    total_input_segments = num_days_in * segments_per_day
+
+    # Reshape data_x: [B, D_in, F, T_x] -> [B, total_input_segments, F * minutes_per_segment]
+    try:
+        reshaped_data_x = data_x.view(
+            batch_size, num_days_in, num_features, segments_per_day, minutes_per_segment
+        ).permute(0, 1, 3, 2, 4).reshape(
+            batch_size, total_input_segments, num_features * minutes_per_segment
+        )
+    except RuntimeError as e:
+         return None, data_y, None # Indicate failure
+
+    # --- Generate predictions ---
+    target_segments = prediction_horizon // minutes_per_segment
+    try:
+        predictions = model.predict_future(reshaped_data_x, steps=target_segments)
+        # Predictions shape: [B, target_segments, num_features * minutes_per_segment]
+    except Exception as e:
+        return None, data_y, None # Indicate failure
+
+    # --- Reshape predictions to match data_y shape ---
+    # Target data_y shape: [B, D_out, F, T_steps_per_day == time_steps_y]
+    batch_size_pred, num_days_out_actual, num_features_pred, T_steps_per_day = data_y.shape
+
+    # Recalculate expected segments per day based on output shape if necessary
+    calculated_segments_per_day_out = T_steps_per_day // minutes_per_segment
+    if calculated_segments_per_day_out * minutes_per_segment != T_steps_per_day:
+        return None, data_y, None
+
+    pred_days_out_calc = target_segments // calculated_segments_per_day_out
+    if target_segments % calculated_segments_per_day_out != 0:
+         pred_days_out = num_days_out_actual
+    else:
+        pred_days_out = pred_days_out_calc
+        if pred_days_out != num_days_out_actual:
+             pred_days_out = num_days_out_actual # Prioritize actual data shape
+
+    # Check if total segments in prediction match expected based on target shape
+    expected_total_segments = pred_days_out * calculated_segments_per_day_out
+    if predictions.shape[1] != expected_total_segments:
+        target_segments = expected_total_segments # Adjust target segments for reshape
+
+    # [B, target_segments, F * min_per_seg] -> [B, D_out, F, T_steps_per_day]
+    try:
+        reshaped_preds = predictions.view(
+            batch_size, target_segments, num_features, minutes_per_segment # B, T_seg_tot, F, M_per_seg
+        ).view(
+            batch_size, pred_days_out, calculated_segments_per_day_out, num_features, minutes_per_segment # B, D_out, S_per_day, F, M_per_seg
+        ).permute(
+            0, 1, 3, 2, 4 # B, D_out, F, S_per_day, M_per_seg
+        ).reshape(
+            batch_size, pred_days_out, num_features, T_steps_per_day # B, D_out, F, T_steps_day
+        )
+
+        # Final shape check and alignment
+        if reshaped_preds.shape != data_y.shape:
+            min_d = min(reshaped_preds.shape[1], data_y.shape[1])
+            min_f = min(reshaped_preds.shape[2], data_y.shape[2])
+            min_t = min(reshaped_preds.shape[3], data_y.shape[3])
+            reshaped_preds = reshaped_preds[:, :min_d, :min_f, :min_t]
+            data_y = data_y[:, :min_d, :min_f, :min_t] # Align labels too
+
+    except (RuntimeError, ValueError) as e:
+        return None, data_y, None # Indicate failure
+
+    return reshaped_preds, data_y, None # Return aligned preds/labels, mask handled separately
+
+
+def _calculate_mae_mse_batch(
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor, # Boolean mask
+    device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Calculates MAE and MSE for a batch, handling masking and NaNs.
+
+    Args:
+        predictions: Predicted values [B, D, F, T].
+        labels: True values [B, D, F, T].
+        mask: Boolean mask for valid elements [B, D, F, T].
+        device: Torch device.
+
+    Returns:
+        Tuple: (batch_mae_sum, batch_mse_sum, batch_channel_mae_sum,
+                batch_channel_mse_sum, batch_channel_element_count)
+               Sums are float64, count is int64. Returns tensors of zeros if inputs are invalid.
+    """
+    if predictions is None or labels is None or mask is None:
+        # Determine num_features safely
+        num_features = labels.shape[2] if labels is not None and len(labels.shape) > 2 else 0
+        zero_f64 = torch.tensor(0.0, dtype=torch.float64, device=device)
+        zero_i64 = torch.tensor(0, dtype=torch.int64, device=device)
+        zero_f64_ch = torch.zeros(num_features, dtype=torch.float64, device=device)
+        zero_i64_ch = torch.zeros(num_features, dtype=torch.int64, device=device)
+        return zero_f64, zero_f64, zero_f64_ch, zero_f64_ch, zero_i64_ch
+
+    abs_error = torch.abs(predictions - labels)
+    sq_error = (predictions - labels)**2
+
+    # Apply mask and handle potential NaNs/Infs resulting from 0 * Inf etc.
+    masked_abs_error = torch.nan_to_num(abs_error * mask, nan=0.0, posinf=0.0, neginf=0.0)
+    masked_sq_error = torch.nan_to_num(sq_error * mask, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Calculate sums and counts
+    batch_mae_sum = masked_abs_error.sum().to(torch.float64)
+    batch_mse_sum = masked_sq_error.sum().to(torch.float64)
+    batch_element_count = mask.sum() # Total valid elements in batch
+
+    # Per-channel sums and counts
+    batch_channel_mae_sum = masked_abs_error.sum(dim=(0, 1, 3)).to(torch.float64) # Sum over B, D_out, T_pred
+    batch_channel_mse_sum = masked_sq_error.sum(dim=(0, 1, 3)).to(torch.float64)
+    batch_channel_element_count = mask.sum(dim=(0, 1, 3)).to(torch.int64)
+
+    return (batch_mae_sum, batch_mse_sum, batch_element_count,
+            batch_channel_mae_sum, batch_channel_mse_sum, batch_channel_element_count)
+
+
+def _calculate_pearson_batch(
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor, # Boolean mask
+    epsilon: float = 1e-9,
+    device: torch.device = torch.device('cpu')
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Calculates Pearson Correlation for a batch, handling masking.
+
+    Args:
+        predictions: Predicted values [B, D, F, T].
+        labels: True values [B, D, F, T].
+        mask: Boolean mask for valid elements [B, D, F, T].
+        epsilon: Small value for numerical stability.
+        device: Torch device.
+
+    Returns:
+        Tuple: (batch_corr_sum, batch_corr_count,
+                batch_channel_corr_sum, batch_channel_corr_count)
+               Sums are float64, counts are int64. Returns tensors of zeros if inputs are invalid.
+    """
+    if predictions is None or labels is None or mask is None or predictions.numel() == 0 or labels.numel() == 0:
+        num_features = labels.shape[2] if labels is not None and len(labels.shape) > 2 else 0
+        zero_f64 = torch.tensor(0.0, dtype=torch.float64, device=device)
+        zero_i64 = torch.tensor(0, dtype=torch.int64, device=device)
+        zero_f64_ch = torch.zeros(num_features, dtype=torch.float64, device=device)
+        zero_i64_ch = torch.zeros(num_features, dtype=torch.int64, device=device)
+        return zero_f64, zero_i64, zero_f64_ch, zero_i64_ch
+
+    b, d, f, t = predictions.shape
+    time_dim = d * t
+
+    # Reshape for correlation: [B, D, F, T] -> [B, F, D * T]
+    preds_flat = predictions.permute(0, 2, 1, 3).reshape(b, f, time_dim)
+    labels_flat = labels.permute(0, 2, 1, 3).reshape(b, f, time_dim)
+    mask_flat = mask.permute(0, 2, 1, 3).reshape(b, f, time_dim) # Boolean mask
+
+    # Clean potential NaNs in labels *outside* the mask
+    labels_flat = torch.where(mask_flat, labels_flat, torch.zeros_like(labels_flat))
+    # Clean predictions as well (though ideally they shouldn't have NaNs if model is stable)
+    preds_flat = torch.where(mask_flat, preds_flat, torch.zeros_like(preds_flat))
+
+    # Calculate needed stats only over valid time points
+    n_valid = mask_flat.sum(dim=2, dtype=torch.float64) # Shape (B, F)
+
+    # Mask out invalid time steps (redundant due to `torch.where` above, but safe)
+    preds_masked = preds_flat * mask_flat
+    labels_masked = labels_flat * mask_flat
+
+    # Calculate means over valid time points
+    sum_x = preds_masked.sum(dim=2)
+    sum_y = labels_masked.sum(dim=2)
+
+    mean_x = torch.where(n_valid > 0, sum_x / n_valid, torch.zeros_like(sum_x)) # Shape (B, F)
+    mean_y = torch.where(n_valid > 0, sum_y / n_valid, torch.zeros_like(sum_y))
+
+    # Calculate centered values (only valid time steps contribute)
+    centered_x = (preds_flat - mean_x.unsqueeze(2)) * mask_flat
+    centered_y = (labels_flat - mean_y.unsqueeze(2)) * mask_flat
+
+    # Calculate terms for correlation formula
+    numerator = (centered_x * centered_y).sum(dim=2) # Sum over time: (B, F)
+    denom_x_sq = (centered_x**2).sum(dim=2) # (B, F)
+    denom_y_sq = (centered_y**2).sum(dim=2) # (B, F)
+
+    # Calculate correlation, handling potential division by zero/low variance
+    denominator = torch.sqrt(denom_x_sq * denom_y_sq)
+    correlation = torch.where(
+        denominator > epsilon,
+        numerator / (denominator + epsilon), # Add epsilon for safety
+        torch.zeros_like(denominator) # Set corr to 0 if variance is near zero
+    ) # Shape (B, F)
+
+    # Mask for valid correlations (need at least 2 points and non-zero variance)
+    valid_corr_mask = (n_valid >= 2) & (denom_x_sq > epsilon) & (denom_y_sq > epsilon) # Shape (B, F)
+
+    # Apply mask to correlations (invalid correlations become 0)
+    valid_correlations = correlation * valid_corr_mask
+
+    # Update running sums and counts for correlation
+    batch_corr_sum = valid_correlations.sum().to(torch.float64)
+    batch_corr_count = valid_corr_mask.sum().to(torch.int64) # Count of valid (B, F) pairs
+
+    batch_channel_corr_sum = valid_correlations.sum(dim=0).to(torch.float64) # Sum over B
+    batch_channel_corr_count = valid_corr_mask.sum(dim=0).to(torch.int64) # Sum over B
+
+    return batch_corr_sum, batch_corr_count, batch_channel_corr_sum, batch_channel_corr_count
+
+
 def evaluate_forecast(
     model: Union[AutoencoderLSTM, RevInAutoencoderLSTM],
     dataframe: pd.DataFrame,
@@ -56,13 +298,13 @@ def evaluate_forecast(
     device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 ) -> Dict:
     """
-    Evaluate forecasting performance of a model.
+    Evaluate forecasting performance of a model using running metrics.
     
     Args:
         model: The LSTM model (AutoencoderLSTM or RevInAutoencoderLSTM)
         dataframe: DataFrame with MHC dataset metadata
         root_dir: Root directory for data files
-        split: String defining the forecast split (e.g., "5-2d" for 5 days input, 2 days forecast)
+        split: String defining the forecast split (e.g., "5-2d")
         batch_size: Batch size for evaluation
         include_mask: Whether to include masks (required for proper evaluation)
         feature_indices: Optional list of feature indices to select
@@ -70,7 +312,7 @@ def evaluate_forecast(
         device: Device to run evaluation on
     
     Returns:
-        Dictionary with MAE metrics per channel and overall
+        Dictionary with MAE, MSE, Pearson Correlation metrics per channel and overall.
     """
     # Parse the split string
     sequence_len, prediction_horizon, overlap = parse_forecast_split(split)
@@ -98,136 +340,133 @@ def evaluate_forecast(
     model.to(device)
     model.eval()
     
-    # Initialize metrics
-    all_errors = []
-    all_masks = []
+    # Determine number of features
+    if feature_indices is not None:
+        num_features = len(feature_indices)
+    elif len(forecast_dataset) > 0:
+        sample = forecast_dataset[0]
+        # Assuming data_x shape is [D, F, T_x] or similar
+        # Check both data_x and data_y for shape info
+        if 'data_x' in sample and len(sample['data_x'].shape) > 1:
+             num_features = sample['data_x'].shape[1] 
+        elif 'data_y' in sample and len(sample['data_y'].shape) > 2:
+             num_features = sample['data_y'].shape[2] # [B, D_out, F, T_pred]
+        else:
+             num_features = 24 # Fallback
+             print("Warning: Could not determine num_features from dataset sample, defaulting to 24.")
+    else:
+        num_features = 24 # Fallback
+        print("Warning: Dataset is empty, defaulting num_features to 24.")
+
+
+    # Initialize running metrics (use float64 for sums)
+    running_mae_sum = torch.tensor(0.0, dtype=torch.float64, device=device)
+    running_mse_sum = torch.tensor(0.0, dtype=torch.float64, device=device)
+    running_cor_sum = torch.tensor(0.0, dtype=torch.float64, device=device)
     
-    # Track per-channel errors
-    num_features = len(feature_indices) if feature_indices is not None else 24
-    channel_errors = [[] for _ in range(num_features)]
-    channel_masks = [[] for _ in range(num_features)]
+    running_element_count = torch.tensor(0, dtype=torch.int64, device=device) # Count for MAE/MSE
+    running_cor_count = torch.tensor(0, dtype=torch.int64, device=device) # Count of valid (sample, feature) pairs for Corr
+
+    channel_mae_sum = torch.zeros(num_features, dtype=torch.float64, device=device)
+    channel_mse_sum = torch.zeros(num_features, dtype=torch.float64, device=device)
+    channel_cor_sum = torch.zeros(num_features, dtype=torch.float64, device=device)
     
+    channel_element_count = torch.zeros(num_features, dtype=torch.int64, device=device) # Count for MAE/MSE per channel
+    channel_cor_count = torch.zeros(num_features, dtype=torch.int64, device=device) # Count for Corr per channel
+    
+    epsilon = 1e-9 # For numerical stability in correlation
+
     with torch.no_grad():
         for batch in dataloader:
             # Move data to device
-            data_x = batch['data_x'].to(device)
-            data_y = batch['data_y'].to(device)
+            data_x = batch['data_x'].to(device) # Shape: [B, D_in, F, T_x]
+            data_y = batch['data_y'].to(device) # Shape: [B, D_out, F, T_pred]
             
             # Get the mask if available
-            mask_y = batch.get('mask_y')
+            mask_y = batch.get('mask_y') # Shape: [B, D_out, F, T_pred] or None
             if mask_y is not None:
                 mask_y = mask_y.to(device)
-            
-            # Reshape data for prediction
-            batch_size, num_days, num_features, time_steps_x = data_x.shape
-            
-            # Reshape to [B, num_days*segments_per_day, num_features*minutes_per_segment]
-            # For the LSTM model's input format
-            segments_per_day = model.segments_per_day
-            minutes_per_segment = model.minutes_per_segment
-            
-            # Calculate how many segments we have in the input
-            input_segments = (num_days * time_steps_x) // (minutes_per_segment)
-            
-            # Reshape data_x to match model's expected input shape for segments
-            reshaped_data_x = data_x.view(batch_size, num_days, num_features, input_segments, minutes_per_segment)
-            reshaped_data_x = reshaped_data_x.permute(0, 1, 3, 2, 4)  # -> [B, num_days, segments, num_features, minutes_per_segment]
-            reshaped_data_x = reshaped_data_x.reshape(batch_size, input_segments, num_features * minutes_per_segment)
-            
-            # Calculate how many segments we need to predict
-            # Convert prediction_horizon (in minutes) to number of segments
-            target_segments = prediction_horizon // minutes_per_segment
-            
-            # Generate predictions
-            predictions = model.predict_future(reshaped_data_x, steps=target_segments)
-            
-            # Reshape predictions to match data_y shape for comparison
-            # Predictions shape: [B, target_segments, num_features*minutes_per_segment]
-            pred_days = target_segments // segments_per_day
-            reshaped_preds = predictions.view(batch_size, target_segments, num_features, minutes_per_segment)
-            reshaped_preds = reshaped_preds.permute(0, 1, 3, 2)  # -> [B, target_segments, minutes_per_segment, num_features]
-            reshaped_preds = reshaped_preds.reshape(batch_size, pred_days, num_features, prediction_horizon)
-            
-            # Calculate absolute error
-            abs_error = torch.abs(reshaped_preds - data_y)
-            
-            # Apply mask if available
-            if mask_y is not None:
-                # For calculating overall MAE
-                masked_abs_error = abs_error * mask_y
-                valid_mask = (mask_y > 0)
-                
-                # For per-channel MAE
-                for f in range(num_features):
-                    channel_error = abs_error[:, :, f, :]
-                    channel_mask = mask_y[:, :, f, :]
-                    
-                    # Check if we have any observed values for this channel
-                    if torch.any(channel_mask > 0):
-                        masked_channel_error = channel_error * channel_mask
-                        channel_errors[f].append(masked_channel_error.cpu().numpy())
-                        channel_masks[f].append(channel_mask.cpu().numpy())
-                
-                # Add to overall metrics
-                all_errors.append(masked_abs_error.cpu().numpy())
-                all_masks.append(valid_mask.cpu().numpy())
+                # Ensure mask is boolean for helper functions
+                valid_mask_elements = (mask_y > 0) 
             else:
-                # Without a mask, use all data
-                for f in range(num_features):
-                    channel_error = abs_error[:, :, f, :]
-                    channel_errors[f].append(channel_error.cpu().numpy())
+                # If no mask, assume all elements are valid
+                valid_mask_elements = torch.ones_like(data_y, dtype=torch.bool, device=device)
+
+            # --- Predict Batch ---
+            predictions, data_y_aligned, _ = _predict_batch(
+                model, data_x, data_y, prediction_horizon, device
+            )
+
+            # Skip batch if prediction/reshaping failed
+            if predictions is None:
+                print("Skipping batch due to prediction/reshaping error.")
+                continue
                 
-                all_errors.append(abs_error.cpu().numpy())
-    
-    # Calculate metrics
+            # Align mask if predictions/labels were aligned
+            if predictions.shape != valid_mask_elements.shape:
+                 print(f"Aligning mask shape from {valid_mask_elements.shape} to {predictions.shape}")
+                 min_d = predictions.shape[1]
+                 min_f = predictions.shape[2]
+                 min_t = predictions.shape[3]
+                 # Assume original mask might have different batch size if error occurred earlier
+                 original_b = valid_mask_elements.shape[0]
+                 pred_b = predictions.shape[0]
+                 if original_b != pred_b:
+                     print(f"Warning: Batch size mismatch between predictions ({pred_b}) and original mask ({original_b}). Cannot align mask.")
+                     continue # Skip batch if batch size changed unexpectedly
+
+                 valid_mask_elements = valid_mask_elements[:, :min_d, :min_f, :min_t]
+
+
+            # --- Calculate MAE/MSE ---
+            (batch_mae_sum, batch_mse_sum, batch_element_count,
+             batch_channel_mae_sum, batch_channel_mse_sum, batch_channel_element_count) = _calculate_mae_mse_batch(
+                predictions, data_y_aligned, valid_mask_elements, device
+            )
+            
+            # Update running MAE/MSE sums and counts
+            running_mae_sum += batch_mae_sum
+            running_mse_sum += batch_mse_sum
+            running_element_count += batch_element_count # Use the count returned by the function
+
+            channel_mae_sum += batch_channel_mae_sum
+            channel_mse_sum += batch_channel_mse_sum
+            channel_element_count += batch_channel_element_count # Use the channel count
+
+            # --- Calculate Pearson Correlation ---
+            (batch_corr_sum, batch_corr_count,
+             batch_channel_corr_sum, batch_channel_corr_count) = _calculate_pearson_batch(
+                predictions, data_y_aligned, valid_mask_elements, epsilon, device
+            )
+
+            # Update running Correlation sums and counts
+            running_cor_sum += batch_corr_sum
+            running_cor_count += batch_corr_count
+
+            channel_cor_sum += batch_channel_corr_sum
+            channel_cor_count += batch_channel_corr_count
+
+
+    # --- Calculate Final Metrics ---
     results = {}
     
-    # Overall MAE
-    if all_masks:
-        # If masks were used
-        all_errors_array = np.concatenate(all_errors, axis=0)
-        all_masks_array = np.concatenate(all_masks, axis=0)
-        
-        # Calculate MAE only over observed values
-        mask_sum = np.sum(all_masks_array)
-        if mask_sum > 0:
-            overall_mae = np.sum(all_errors_array) / mask_sum
-        else:
-            overall_mae = np.nan
-    else:
-        # If no masks were used
-        all_errors_array = np.concatenate(all_errors, axis=0)
-        overall_mae = np.mean(all_errors_array)
+    # Overall metrics
+    overall_mae = (running_mae_sum / running_element_count) if running_element_count > 0 else torch.tensor(float('nan'))
+    overall_mse = (running_mse_sum / running_element_count) if running_element_count > 0 else torch.tensor(float('nan'))
+    overall_cor = (running_cor_sum / running_cor_count) if running_cor_count > 0 else torch.tensor(float('nan'))
     
-    results['overall_mae'] = float(overall_mae)
-    
-    # Per-channel MAE
-    channel_maes = []
-    for f in range(num_features):
-        if channel_masks and len(channel_masks[f]) > 0:
-            # With masks
-            try:
-                channel_errors_array = np.concatenate(channel_errors[f], axis=0)
-                channel_masks_array = np.concatenate(channel_masks[f], axis=0)
-                
-                mask_sum = np.sum(channel_masks_array)
-                if mask_sum > 0:
-                    channel_mae = np.sum(channel_errors_array) / mask_sum
-                else:
-                    channel_mae = np.nan
-            except ValueError:
-                # Handle case where no data was available for this channel
-                channel_mae = np.nan
-        elif len(channel_errors[f]) > 0:
-            # Without masks
-            channel_errors_array = np.concatenate(channel_errors[f], axis=0)
-            channel_mae = np.mean(channel_errors_array)
-        else:
-            channel_mae = np.nan
-        
-        channel_maes.append(float(channel_mae))
-    
-    results['channel_mae'] = channel_maes
+    results['overall_mae'] = overall_mae.item()
+    results['overall_mse'] = overall_mse.item()
+    results['overall_pearson_corr'] = overall_cor.item()
+
+    # Per-channel metrics
+    channel_mae = torch.where(channel_element_count > 0, channel_mae_sum / channel_element_count, torch.tensor(float('nan'), device=device))
+    channel_mse = torch.where(channel_element_count > 0, channel_mse_sum / channel_element_count, torch.tensor(float('nan'), device=device))
+    channel_cor = torch.where(channel_cor_count > 0, channel_cor_sum / channel_cor_count, torch.tensor(float('nan'), device=device))
+
+    results['channel_mae'] = channel_mae.cpu().tolist()
+    results['channel_mse'] = channel_mse.cpu().tolist()
+    results['channel_pearson_corr'] = channel_cor.cpu().tolist()
     
     return results
 
@@ -243,7 +482,7 @@ def run_forecast_evaluation(
     feature_names: Optional[List[str]] = None,
     feature_stats: Optional[Dict] = None,
     device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-) -> None:
+) -> Dict: # Return results dict
     """
     Run forecast evaluation and print formatted results.
     
@@ -258,9 +497,10 @@ def run_forecast_evaluation(
         feature_names: Optional list of feature names for reporting
         feature_stats: Optional dictionary for feature standardization
         device: Device to run evaluation on
+        
+    Returns:
+        Dictionary containing the evaluation results.
     """
-    print(f"Running forecast evaluation with split: {split}")
-    
     # Run evaluation
     results = evaluate_forecast(
         model=model,
@@ -274,31 +514,48 @@ def run_forecast_evaluation(
         device=device
     )
     
-    # Print overall results
-    print(f"\nOverall MAE: {results['overall_mae']:.4f}")
+    # --- Print Overall Results ---
+    print("\n--- Overall Metrics ---")
+    print(f"MAE:            {results.get('overall_mae', float('nan')):.4f}")
+    print(f"MSE:            {results.get('overall_mse', float('nan')):.4f}")
+    print(f"Pearson Corr.:  {results.get('overall_pearson_corr', float('nan')):.4f}")
     
-    # Print per-channel results
-    print("\nPer-Channel MAE:")
-    channel_maes = results['channel_mae']
-    
-    # Use feature names if provided, otherwise use indices
-    if feature_names and len(feature_names) == len(channel_maes):
+    # --- Print Per-Channel Results ---
+    print("\n--- Per-Channel Metrics ---")
+    channel_maes = results.get('channel_mae', [])
+    channel_mses = results.get('channel_mse', [])
+    channel_cors = results.get('channel_pearson_corr', [])
+    num_channels = len(channel_maes)
+
+    # Determine feature labels
+    if feature_names and len(feature_names) == num_channels:
         feature_labels = feature_names
-    elif feature_indices and len(feature_indices) == len(channel_maes):
+    elif feature_indices and len(feature_indices) == num_channels:
         feature_labels = [f"Feature {i}" for i in feature_indices]
     else:
-        feature_labels = [f"Feature {i}" for i in range(len(channel_maes))]
+        feature_labels = [f"Feature {i}" for i in range(num_channels)]
     
     # Print table header
-    print(f"{'Feature':<20} {'MAE':<10}")
-    print("-" * 30)
+    header = f"{'Feature':<20} {'MAE':<10} {'MSE':<10} {'Corr':<10}"
+    print(header)
+    print("-" * len(header))
     
-    # Print each channel's MAE
-    for label, mae in zip(feature_labels, channel_maes):
+    # Print each channel's metrics
+    for i in range(num_channels):
+        label = feature_labels[i]
+        mae = channel_maes[i] if i < len(channel_maes) else float('nan')
+        mse = channel_mses[i] if i < len(channel_mses) else float('nan')
+        corr = channel_cors[i] if i < len(channel_cors) else float('nan')
+        
         mae_str = f"{mae:.4f}" if not np.isnan(mae) else "NaN"
-        print(f"{label:<20} {mae_str:<10}")
+        mse_str = f"{mse:.4f}" if not np.isnan(mse) else "NaN"
+        corr_str = f"{corr:.4f}" if not np.isnan(corr) else "NaN"
+        
+        print(f"{label:<20} {mae_str:<10} {mse_str:<10} {corr_str:<10}")
+        
+    print("-" * len(header))
     
-    return results
+    return results # Return the results dictionary
 
 
 # Usage example:
@@ -312,52 +569,50 @@ if __name__ == "__main__":
     parser.add_argument('--data_root', type=str, required=True, help='Root directory of MHC data')
     parser.add_argument('--split', type=str, default='5-2d', help='Forecast split (e.g., "5-2d")')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for evaluation')
+    parser.add_argument('--no_mask', action='store_true', help='Disable using mask during evaluation')
     args = parser.parse_args()
     
     # Load the CSV file
     try:
         df = pd.read_csv(args.data_csv)
-        print(f"Loaded data CSV with {len(df)} entries")
+        if 'split' in df.columns:
+             test_df = df[df['split'] == 'test'].reset_index(drop=True)
+             if len(test_df) == 0:
+                 test_df = df
+        else:
+             test_df = df
     except Exception as e:
-        print(f"Error loading CSV: {e}")
+        print(f"Error loading or processing CSV: {e}")
         exit(1)
     
     # Create model (will be filled with checkpoint weights)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
     
-    # Example model initialization - parameters will be overwritten by checkpoint
-    model = RevInAutoencoderLSTM(
+    model_instance = RevInAutoencoderLSTM(
         hidden_size=128,
         encoding_dim=100,
         num_layers=2
-    )
+    ) 
     
     # Load checkpoint
     try:
-        model, _ = load_checkpoint(args.checkpoint, model, device)
-        print(f"Successfully loaded model from {args.checkpoint}")
+        model, optimizer_state, epoch, loss = load_checkpoint(args.checkpoint, model_instance, None, device)
     except Exception as e:
         print(f"Error loading checkpoint: {e}")
         exit(1)
     
-    # Example feature names for better reporting
-    feature_names = [
-        "Feature 0", "Feature 1", "Feature 2", "Feature 3",
-        "Feature 4", "Feature 5", "Feature 6", "Feature 7",
-        "Feature 8", "Feature 9", "Feature 10", "Feature 11",
-        "Feature 12", "Feature 13", "Feature 14", "Feature 15",
-        "Feature 16", "Feature 17", "Feature 18", "Feature 19",
-        "Feature 20", "Feature 21", "Feature 22", "Feature 23"
-    ]
+    # Feature names
+    num_features_loaded = model.num_features
+    feature_names = [f"Feature_{i}" for i in range(num_features_loaded)]
     
     # Run evaluation
-    run_forecast_evaluation(
+    evaluation_results = run_forecast_evaluation(
         model=model,
-        dataframe=df,
+        dataframe=test_df,
         root_dir=args.data_root,
         split=args.split,
         batch_size=args.batch_size,
-        include_mask=True,
-        feature_names=feature_names
-    ) 
+        include_mask=(not args.no_mask),
+        feature_names=feature_names,
+        device=device
+    )

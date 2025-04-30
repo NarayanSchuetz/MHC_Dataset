@@ -242,7 +242,7 @@ class TestMhcDatasets(unittest.TestCase):
         torch.testing.assert_close(sample['mask'][1], expected_mask2)
 
         # Check day 3 (missing) is NaN placeholder for data, zero placeholder for mask
-        self.assertTrue(torch.all(torch.isnan(sample['data'][2])))
+        self.assertTrue(torch.all(sample['data'][2] == 0), "Missing day data should be all 0s now")
         self.assertTrue(torch.all(sample['mask'][2] == 0))
 
         # Check labels
@@ -266,7 +266,7 @@ class TestMhcDatasets(unittest.TestCase):
 
 
         # Check day 2 (listed but not found) is placeholder
-        self.assertTrue(torch.all(torch.isnan(sample['data'][1])))
+        self.assertTrue(torch.all(sample['data'][1] == 0), "File not found data should be all 0s now")
         self.assertTrue(torch.all(sample['mask'][1] == 0))
 
         # Check labels and metadata
@@ -284,7 +284,7 @@ class TestMhcDatasets(unittest.TestCase):
         # Expect placeholders for all days in the time range
         self.assertEqual(sample['data'].shape, (2, self.raw_features, self.time_points)) # 2 days in range
         self.assertEqual(sample['mask'].shape, (2, self.raw_features, self.time_points))
-        self.assertTrue(torch.all(torch.isnan(sample['data'])))
+        self.assertTrue(torch.all(sample['data'] == 0), "Empty file_uris data should be all 0s now")
         self.assertTrue(torch.all(sample['mask'] == 0))
 
 
@@ -297,7 +297,7 @@ class TestMhcDatasets(unittest.TestCase):
          # Expect placeholders for all days in the time range
          self.assertEqual(sample['data'].shape, (1, self.raw_features, self.time_points)) # 1 day in range
          self.assertEqual(sample['mask'].shape, (1, self.raw_features, self.time_points))
-         self.assertTrue(torch.all(torch.isnan(sample['data'])))
+         self.assertTrue(torch.all(sample['data'] == 0), "NaN file_uris data should be all 0s now")
          self.assertTrue(torch.all(sample['mask'] == 0))
 
     def test_base_getitem_file_load_error_wrong_shape(self):
@@ -308,10 +308,10 @@ class TestMhcDatasets(unittest.TestCase):
         # Should return placeholder when encountering wrong shape
         sample = dataset[idx]
         
-        # Verify a placeholder was returned (NaN for data, zeros for mask)
+        # Verify a placeholder was returned (zeros for data, zeros for mask)
         self.assertEqual(sample['data'].shape, (1, self.raw_features, self.time_points))
         self.assertEqual(sample['mask'].shape, (1, self.raw_features, self.time_points))
-        self.assertTrue(torch.all(torch.isnan(sample['data'])), "Data should be all NaN")
+        self.assertTrue(torch.all(sample['data'] == 0), "Data should be all 0s")
         self.assertTrue(torch.all(sample['mask'] == 0), "Mask should be all zeros")
 
     def test_base_getitem_file_load_error_wrong_dims(self):
@@ -322,10 +322,10 @@ class TestMhcDatasets(unittest.TestCase):
         # Should return placeholder when encountering wrong dimensions
         sample = dataset[idx]
         
-        # Verify a placeholder was returned (NaN for data, zeros for mask)
+        # Verify a placeholder was returned (zeros for data, zeros for mask)
         self.assertEqual(sample['data'].shape, (1, self.raw_features, self.time_points))
         self.assertEqual(sample['mask'].shape, (1, self.raw_features, self.time_points))
-        self.assertTrue(torch.all(torch.isnan(sample['data'])), "Data should be all NaN")
+        self.assertTrue(torch.all(sample['data'] == 0), "Data should be all 0s")
         self.assertTrue(torch.all(sample['mask'] == 0), "Mask should be all zeros")
 
 
@@ -337,10 +337,10 @@ class TestMhcDatasets(unittest.TestCase):
         # Should return placeholder when encountering wrong first dimension
         sample = dataset[idx]
         
-        # Verify a placeholder was returned (NaN for data, zeros for mask)
+        # Verify a placeholder was returned (zeros for data, zeros for mask)
         self.assertEqual(sample['data'].shape, (1, self.raw_features, self.time_points))
         self.assertEqual(sample['mask'].shape, (1, self.raw_features, self.time_points))
-        self.assertTrue(torch.all(torch.isnan(sample['data'])), "Data should be all NaN")
+        self.assertTrue(torch.all(sample['data'] == 0), "Data should be all 0s")
         self.assertTrue(torch.all(sample['mask'] == 0), "Mask should be all zeros")
 
 
@@ -647,7 +647,7 @@ class TestMhcDatasets(unittest.TestCase):
         self.assertEqual(sample1['metadata']['healthCode'], "healthCode1")
         self.assertEqual(sample1['labels']['labelB'], 0.7)
         # Ensure data loading still works (this sample had a load error for its file)
-        self.assertTrue(torch.all(torch.isnan(sample1['data'])))
+        self.assertTrue(torch.all(sample1['data'] == 0), "Placeholder data should now be 0s instead of NaNs")
 
         # Get the third sample (original index 3)
         sample2 = dataset[2]
@@ -742,7 +742,7 @@ class TestMhcDatasets(unittest.TestCase):
          self.assertEqual(sample3['labels']['labelA'], 5.0)
          # This sample had a load error (wrong dims)
          self.assertEqual(sample3['data'].shape, (1, 2, self.time_points)) # 1 day, 2 features
-         self.assertTrue(torch.all(torch.isnan(sample3['data'])))
+         self.assertTrue(torch.all(sample3['data'] == 0), "Placeholder data should now be 0s instead of NaNs")
          self.assertTrue(torch.all(sample3['mask'] == 0))
 
 
@@ -1486,10 +1486,57 @@ class TestFlattenedMhcDataset(unittest.TestCase):
         torch.testing.assert_close(sample['mask'][:, :self.time_points], orig_day1_mask)
         torch.testing.assert_close(sample['mask'][:, self.time_points:2*self.time_points], orig_day2_mask)
 
-        # Check third day's data (placeholder)
-        self.assertTrue(torch.all(torch.isnan(sample['data'][:, 2*self.time_points:])))
+        # Check third day's data (placeholder) - should be zeros, not NaNs
+        self.assertTrue(torch.all(sample['data'][:, 2*self.time_points:] == 0.0))
         # Check third day's mask (placeholder)
         self.assertTrue(torch.all(sample['mask'][:, 2*self.time_points:] == 0))
+    
+    def test_nan_replacement(self):
+        """Test that NaN values are properly replaced with zeros in dataset outputs."""
+        # Create a dataset with missing days to ensure NaN placeholders are created
+        idx = 2  # Day 1, 2 present, Day 3 missing
+        
+        # Test with different dataset types
+        datasets = [
+            BaseMhcDataset(self.df, self.root_dir, include_mask=True),
+            FilteredMhcDataset(self.df, self.root_dir, "labelA", include_mask=True),
+            FlattenedMhcDataset(self.df, self.root_dir, include_mask=True),
+            ForecastingEvaluationDataset(
+                self.df, self.root_dir, 
+                sequence_len=self.time_points, 
+                prediction_horizon=self.time_points,
+                include_mask=True
+            )
+        ]
+        
+        for dataset in datasets:
+            # Get sample which should have NaN placeholders internally
+            sample = dataset[idx]
+            
+            # For ForecastingEvaluationDataset, check both data_x and data_y
+            if isinstance(dataset, ForecastingEvaluationDataset):
+                self.assertFalse(torch.isnan(sample['data_x']).any(),
+                                f"Found NaNs in data_x tensor for {dataset.__class__.__name__}")
+                self.assertFalse(torch.isnan(sample['data_y']).any(),
+                                f"Found NaNs in data_y tensor for {dataset.__class__.__name__}")
+                
+                # Check mask tensors if they exist
+                if 'mask_x' in sample:
+                    self.assertFalse(torch.isnan(sample['mask_x']).any(),
+                                    f"Found NaNs in mask_x tensor for {dataset.__class__.__name__}")
+                if 'mask_y' in sample:
+                    self.assertFalse(torch.isnan(sample['mask_y']).any(),
+                                    f"Found NaNs in mask_y tensor for {dataset.__class__.__name__}")
+            # For all other dataset types
+            else:
+                # Check data tensor has no NaNs
+                self.assertFalse(torch.isnan(sample['data']).any(), 
+                               f"Found NaNs in data tensor for {dataset.__class__.__name__}")
+                
+                # Check mask tensor has no NaNs
+                if 'mask' in sample:
+                    self.assertFalse(torch.isnan(sample['mask']).any(),
+                                   f"Found NaNs in mask tensor for {dataset.__class__.__name__}")
 
 
 if __name__ == '__main__':

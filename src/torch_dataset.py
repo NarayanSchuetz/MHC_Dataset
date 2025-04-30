@@ -440,6 +440,14 @@ class BaseMhcDataset(Dataset):
         result_dict['labels'] = labels
         result_dict['metadata'] = metadata
 
+        # Replace NaNs with 0.0 in final tensors
+        if 'data' in result_dict and isinstance(result_dict['data'], torch.Tensor):
+            result_dict['data'] = torch.nan_to_num(result_dict['data'], nan=0.0)
+        if 'mask' in result_dict and isinstance(result_dict['mask'], torch.Tensor):
+            # Although mask placeholders are zeros, apply defensively
+            result_dict['mask'] = torch.nan_to_num(result_dict['mask'], nan=0.0)
+
+
         return result_dict
 
 
@@ -527,6 +535,83 @@ class FilteredMhcDataset(BaseMhcDataset):
 
         # Store the label of interest for reference
         self.label_of_interest = label_of_interest
+
+
+class FlattenedMhcDataset(BaseMhcDataset):
+    """
+    A subclass of BaseMhcDataset that flattens the time dimension.
+
+    It loads the data identically to BaseMhcDataset but reshapes the output
+    'data' and 'mask' tensors to combine the day and time_point dimensions.
+
+    Output sample['data'] shape: (num_selected_features, num_days * 1440)
+    Output sample['mask'] shape (if include_mask=True): (num_selected_features, num_days * 1440)
+    """
+
+    def __init__(self,
+                 dataframe: pd.DataFrame,
+                 root_dir: str,
+                 include_mask: bool = False,
+                 feature_indices: Optional[List[int]] = None,
+                 feature_stats: Optional[dict] = None):
+        """
+        Initializes the FlattenedMhcDataset. Arguments are passed directly
+        to the BaseMhcDataset constructor.
+
+        Args:
+            dataframe (pd.DataFrame): The denormalized dataframe.
+            root_dir (str): The root directory containing participant subdirectories.
+            include_mask (bool): Whether to load and include a mask channel.
+            feature_indices (Optional[List[int]]): Optional list of feature indices.
+            feature_stats (Optional[dict]): Optional dictionary for feature standardization.
+        """
+        super().__init__(dataframe=dataframe,
+                         root_dir=root_dir,
+                         include_mask=include_mask,
+                         feature_indices=feature_indices,
+                         feature_stats=feature_stats)
+        logger.info("Initialized FlattenedMhcDataset. Output data/mask shape will be (num_features, num_days * 1440).")
+
+    def __getitem__(self, idx):
+        """
+        Retrieves a sample from the dataset and reshapes the data/mask tensors.
+
+        Calls the parent __getitem__ and then reshapes the 'data' and 'mask'
+        tensors from (num_days, num_features, 1440) to
+        (num_features, num_days * 1440).
+
+        Args:
+            idx (int): The index of the sample to retrieve.
+
+        Returns:
+            dict: A dictionary containing:
+                - 'data' (torch.Tensor): Shape (num_selected_features, num_days * 1440).
+                - 'mask' (torch.Tensor, optional): Shape (num_selected_features, num_days * 1440).
+                - 'labels' (dict): Label values.
+                - 'metadata' (dict): Metadata.
+        """
+        # Get the original sample with shape (D, F, T)
+        sample = super().__getitem__(idx)
+
+        data_tensor = sample['data'] # Shape (D, F, T)
+        num_days, num_features, time_points = data_tensor.shape
+        total_time_points = num_days * time_points
+
+        # Reshape data: (D, F, T) -> (F, D, T) -> (F, D * T)
+        reshaped_data = data_tensor.permute(1, 0, 2).reshape(num_features, total_time_points)
+        sample['data'] = reshaped_data
+
+        # Reshape mask if it exists
+        if 'mask' in sample:
+            mask_tensor = sample['mask'] # Shape (D, F, T)
+            # Ensure mask shape matches data shape before permuting
+            if mask_tensor.shape == (num_days, num_features, time_points):
+                 reshaped_mask = mask_tensor.permute(1, 0, 2).reshape(num_features, total_time_points)
+                 sample['mask'] = reshaped_mask
+            else:
+                 logger.warning(f"Mask shape {mask_tensor.shape} does not match data shape {(num_days, num_features, time_points)} for sample {idx}. Skipping mask reshape.")
+
+        return sample
 
 
 class ForecastingEvaluationDataset(BaseMhcDataset):
@@ -715,79 +800,149 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
         return result_dict
 
 
-class FlattenedMhcDataset(BaseMhcDataset):
+class FlattenedForecastingDataset(FlattenedMhcDataset):
     """
-    A subclass of BaseMhcDataset that flattens the time dimension.
+    A subclass of FlattenedMhcDataset designed for forecasting tasks with flattened data.
 
-    It loads the data identically to BaseMhcDataset but reshapes the output
-    'data' and 'mask' tensors to combine the day and time_point dimensions.
+    It takes the flattened time series data loaded by the parent class and splits it
+    into input sequences (data_x) and target sequences (data_y) based on
+    specified lengths and overlap.
 
-    Output sample['data'] shape: (num_selected_features, num_days * 1440)
-    Output sample['mask'] shape (if include_mask=True): (num_selected_features, num_days * 1440)
+    Assumes the base data loaded by `FlattenedMhcDataset.__getitem__` has shape
+    (num_selected_features, num_days * num_time_points).
+
+    Output `data_x` shape: (num_selected_features, sequence_len)
+    Output `data_y` shape: (num_selected_features, prediction_horizon)
+    Output `mask_x`/`mask_y` shapes follow `data_x`/`data_y` if `include_mask=True`.
+
+    Raises:
+        ValueError: If `sequence_len`, `prediction_horizon`, or `overlap` parameters
+                    are invalid or result in indices outside the available time points.
     """
-
     def __init__(self,
                  dataframe: pd.DataFrame,
                  root_dir: str,
+                 sequence_len: int,
+                 prediction_horizon: int,
+                 overlap: int = 0,
                  include_mask: bool = False,
                  feature_indices: Optional[List[int]] = None,
                  feature_stats: Optional[dict] = None):
         """
-        Initializes the FlattenedMhcDataset. Arguments are passed directly
-        to the BaseMhcDataset constructor.
-
         Args:
             dataframe (pd.DataFrame): The denormalized dataframe.
             root_dir (str): The root directory containing participant subdirectories.
-            include_mask (bool): Whether to load and include a mask channel.
-            feature_indices (Optional[List[int]]): Optional list of feature indices.
+            sequence_len (int): The length of the input sequence (x) along the time axis.
+            prediction_horizon (int): The length of the target sequence (y) along the time axis.
+            overlap (int): The number of time points the end of x overlaps with the start of y.
+                           Can be positive (overlap), zero (adjacent), or negative (gap).
+                           Defaults to 0.
+            include_mask (bool): Whether to load and include a mask channel. Passed to FlattenedMhcDataset.
+                                 If True, 'mask_x' and 'mask_y' will be included in the output.
+            feature_indices (Optional[List[int]]): Optional list of feature indices to select.
+                                                    Passed to FlattenedMhcDataset.
             feature_stats (Optional[dict]): Optional dictionary for feature standardization.
+                                            Passed to FlattenedMhcDataset.
         """
-        super().__init__(dataframe=dataframe,
-                         root_dir=root_dir,
-                         include_mask=include_mask,
-                         feature_indices=feature_indices,
-                         feature_stats=feature_stats)
-        logger.info("Initialized FlattenedMhcDataset. Output data/mask shape will be (num_features, num_days * 1440).")
+        # --- Parameter Validation ---
+        if not isinstance(sequence_len, int) or sequence_len <= 0:
+            raise ValueError("sequence_len must be a positive integer.")
+        if not isinstance(prediction_horizon, int) or prediction_horizon <= 0:
+            raise ValueError("prediction_horizon must be a positive integer.")
+        if not isinstance(overlap, int):
+             raise ValueError("overlap must be an integer.")
+
+        # Check if the required time span fits within the expected time points
+        x_start = 0
+        x_end = sequence_len
+        y_start = sequence_len - overlap
+        y_end = y_start + prediction_horizon
+
+        if x_start < 0:
+             raise ValueError("Calculated x_start index is negative (should not happen with current logic).")
+        if y_start < 0:
+             raise ValueError(f"Calculated y_start index ({y_start}) is negative. "
+                              f"Check sequence_len ({sequence_len}) and overlap ({overlap}).")
+
+        # --- Store Forecasting Parameters ---
+        self.sequence_len = sequence_len
+        self.prediction_horizon = prediction_horizon
+        self.overlap = overlap
+
+        # --- Initialize Parent Class ---
+        # This handles validation/setup for dataframe, root_dir, include_mask,
+        # feature_indices, and feature_stats.
+        super().__init__(
+            dataframe=dataframe,
+            root_dir=root_dir,
+            include_mask=include_mask,
+            feature_indices=feature_indices,
+            feature_stats=feature_stats
+        )
+        logger.info(f"Initialized FlattenedForecastingDataset with sequence_len={sequence_len}, "
+                    f"prediction_horizon={prediction_horizon}, overlap={overlap}.")
+        logger.info(f"Input sequence (x) will span indices [{x_start}:{x_end}].")
+        logger.info(f"Target sequence (y) will span indices [{y_start}:{y_end}].")
+
 
     def __getitem__(self, idx):
         """
-        Retrieves a sample from the dataset and reshapes the data/mask tensors.
-
-        Calls the parent __getitem__ and then reshapes the 'data' and 'mask'
-        tensors from (num_days, num_features, 1440) to
-        (num_features, num_days * 1440).
+        Retrieves a sample and splits its flattened time series data into input (x) and target (y).
 
         Args:
             idx (int): The index of the sample to retrieve.
 
         Returns:
             dict: A dictionary containing:
-                - 'data' (torch.Tensor): Shape (num_selected_features, num_days * 1440).
-                - 'mask' (torch.Tensor, optional): Shape (num_selected_features, num_days * 1440).
-                - 'labels' (dict): Label values.
-                - 'metadata' (dict): Metadata.
+                - 'data_x' (torch.Tensor): Input sequence, shape (num_features, sequence_len).
+                - 'data_y' (torch.Tensor): Target sequence, shape (num_features, prediction_horizon).
+                - 'mask_x' (torch.Tensor, optional): Mask for input sequence. Included if `include_mask=True`.
+                - 'mask_y' (torch.Tensor, optional): Mask for target sequence. Included if `include_mask=True`.
+                - 'labels' (dict): Label values from the original sample.
+                - 'metadata' (dict): Metadata from the original sample.
         """
-        # Get the original sample with shape (D, F, T)
-        sample = super().__getitem__(idx)
+        # 1. Get the full sample from the parent class (already flattened)
+        base_sample = super().__getitem__(idx)
 
-        data_tensor = sample['data'] # Shape (D, F, T)
-        num_days, num_features, time_points = data_tensor.shape
-        total_time_points = num_days * time_points
+        # 2. Extract full flattened data and mask (if applicable)
+        full_data = base_sample['data']  # Shape: (num_features, num_days * 1440)
+        full_mask = base_sample.get('mask')  # Shape: (num_features, num_days * 1440) or None
 
-        # Reshape data: (D, F, T) -> (F, D, T) -> (F, D * T)
-        reshaped_data = data_tensor.permute(1, 0, 2).reshape(num_features, total_time_points)
-        sample['data'] = reshaped_data
+        # 3. Calculate split indices for the flattened dimension
+        x_start = 0
+        x_end = self.sequence_len
+        y_start = self.sequence_len - self.overlap
+        y_end = y_start + self.prediction_horizon
 
-        # Reshape mask if it exists
-        if 'mask' in sample:
-            mask_tensor = sample['mask'] # Shape (D, F, T)
-            # Ensure mask shape matches data shape before permuting
-            if mask_tensor.shape == (num_days, num_features, time_points):
-                 reshaped_mask = mask_tensor.permute(1, 0, 2).reshape(num_features, total_time_points)
-                 sample['mask'] = reshaped_mask
-            else:
-                 logger.warning(f"Mask shape {mask_tensor.shape} does not match data shape {(num_days, num_features, time_points)} for sample {idx}. Skipping mask reshape.")
+        # 4. Validate indices against total available time points
+        num_features, total_time_points = full_data.shape
+        if x_end > total_time_points:
+            raise ValueError(f"Required input sequence length ({self.sequence_len}) exceeds total available time points ({total_time_points}) for sample index {idx}.")
+        if y_end > total_time_points:
+            raise ValueError(f"Required target end point ({y_end}) exceeds total available time points ({total_time_points}) for sample index {idx}.")
+        if y_start < 0:
+            raise ValueError(f"Calculated y_start ({y_start}) is negative for sample index {idx}. Check sequence_len/overlap.")
 
+        # 5. Perform the split on the flattened time dimension (axis 1)
+        data_x = full_data[:, x_start:x_end]
+        data_y = full_data[:, y_start:y_end]
 
-        return sample
+        # 6. Prepare the result dictionary, copying labels and metadata
+        result_dict = {
+            'data_x': data_x,  # Shape: (num_features, sequence_len)
+            'data_y': data_y,  # Shape: (num_features, prediction_horizon)
+            'labels': base_sample['labels'],
+            'metadata': base_sample['metadata']
+        }
+
+        # 7. Perform the split on the mask if it exists and was requested
+        if self.include_mask and full_mask is not None:
+            mask_x = full_mask[:, x_start:x_end]
+            mask_y = full_mask[:, y_start:y_end]
+            result_dict['mask_x'] = mask_x
+            result_dict['mask_y'] = mask_y
+        elif self.include_mask:
+            logger.warning(f"Mask was requested (include_mask=True) but not found in base_sample "
+                          f"for index {idx}. 'mask_x' and 'mask_y' will be missing.")
+
+        return result_dict
