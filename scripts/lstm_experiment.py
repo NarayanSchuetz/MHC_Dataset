@@ -295,8 +295,8 @@ def main():
         # Train for one epoch
         train_loss = trainer.train_epoch(train_loader)
         
-        # Validate
-        val_loss = trainer.validate(val_loader)
+        # Validate with teacher forcing explicitly enabled
+        val_loss = trainer.validate(val_loader, use_teacher_forcing=True)
         
         # Log to wandb
         wandb.log({

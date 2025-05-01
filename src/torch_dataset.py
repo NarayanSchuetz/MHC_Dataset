@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import os
 from pathlib import Path
-from typing import List, Union, Tuple, Optional # Added Union, Tuple, Optional
+from typing import List, Union, Tuple, Optional, Callable # Added Union, Tuple, Optional, Callable
 from datetime import datetime, timedelta # Added for date range handling
 import warnings # Add warnings import
 import logging # Add logging import
@@ -49,7 +49,8 @@ class BaseMhcDataset(Dataset):
                  root_dir: str,
                  include_mask: bool = False,
                  feature_indices: Optional[List[int]] = None,
-                 feature_stats: Optional[dict] = None):
+                 feature_stats: Optional[dict] = None,
+                 postprocessors: Optional[List[Callable]] = None):
         """
         Args:
             dataframe (pd.DataFrame): The denormalized dataframe.
@@ -66,6 +67,10 @@ class BaseMhcDataset(Dataset):
                                              Example: {0: (0.5, 1.0), 1: (0.0, 2.0)} for standardizing
                                              original features 0 and 1. Standardization happens
                                              *after* feature selection.
+            postprocessors (Optional[List[Callable]]): A list of callable objects (e.g., functions
+                                                       or instances with __call__) that will be applied
+                                                       sequentially to the sample dictionary in __getitem__
+                                                       after all other processing.
         """
         super().__init__()
         if not isinstance(dataframe, pd.DataFrame):
@@ -155,7 +160,7 @@ class BaseMhcDataset(Dataset):
         self.df = dataframe.reset_index(drop=True)
         self.root_dir = Path(os.path.expanduser(root_dir))
         self.include_mask = include_mask
-        # self.feature_stats = feature_stats # Already stored
+        self.postprocessors = postprocessors if postprocessors is not None else [] # Store postprocessors
 
         # Identify label columns
         self.label_cols = sorted([col for col in self.df.columns if col.endswith('_value')])
@@ -283,7 +288,7 @@ class BaseMhcDataset(Dataset):
                 - 'mask' (torch.Tensor, optional): Shape (num_days, num_selected_features, 1440).
                   Included if `include_mask` was True.
                 - 'labels' (dict): Label values.
-                - 'metadata' (dict): Includes 'healthCode', 'time_range'.
+                - 'metadata' (dict): Includes 'healthCode', 'time_range', 'feature_indices'.
         """
         if idx < 0 or idx >= len(self.df):
             raise IndexError(f"Index {idx} out of bounds for dataset with length {len(self.df)}")
@@ -433,7 +438,7 @@ class BaseMhcDataset(Dataset):
             'healthCode': health_code,
             'time_range': time_range_str,
             # 'file_uris': file_uris_list # Maybe too much data?
-            # 'original_feature_indices': self.feature_indices # Add if useful
+            'feature_indices': self.feature_indices # Pass selected indices for postprocessors
         }
 
         # Add labels and metadata to the result dict
@@ -447,6 +452,22 @@ class BaseMhcDataset(Dataset):
             # Although mask placeholders are zeros, apply defensively
             result_dict['mask'] = torch.nan_to_num(result_dict['mask'], nan=0.0)
 
+        # 7. Apply postprocessors sequentially
+        for processor in self.postprocessors:
+             if callable(processor):
+                 try:
+                     # Processor should take the sample dict and return the modified dict
+                     result_dict = processor(result_dict)
+                 except Exception as e:
+                     logger.error(f"Error applying postprocessor {type(processor).__name__} to sample {idx}: {e}", exc_info=True)
+                     # Reraise to make the problem visible during development/debugging
+                     raise RuntimeError(f"Postprocessor {type(processor).__name__} failed for sample {idx}") from e
+             else:
+                 logger.warning(f"Item in postprocessors list is not callable: {type(processor)}. Skipping.")
+
+        # Apply mask to data: explicitly zero out data values where mask is 0
+        if 'data' in result_dict and 'mask' in result_dict:
+            result_dict['data'] = result_dict['data'] * result_dict['mask']
 
         return result_dict
 
@@ -489,7 +510,8 @@ class FilteredMhcDataset(BaseMhcDataset):
                  label_of_interest: str,
                  include_mask: bool = False,
                  feature_indices: Optional[List[int]] = None,
-                 feature_stats: Optional[dict] = None):
+                 feature_stats: Optional[dict] = None,
+                 postprocessors: Optional[List[Callable]] = None):
         """
         Args:
             dataframe (pd.DataFrame): The denormalized dataframe containing metadata and labels.
@@ -501,6 +523,7 @@ class FilteredMhcDataset(BaseMhcDataset):
                                                     Passed to BaseMhcDataset.
             feature_stats (Optional[dict]): Optional dictionary for feature standardization.
                                             Passed to BaseMhcDataset.
+            postprocessors (Optional[List[Callable]]): Postprocessors passed to BaseMhcDataset.
         """
         # Ensure the label_of_interest has the '_value' suffix for filtering
         label_col = f"{label_of_interest}_value" if not label_of_interest.endswith('_value') else label_of_interest
@@ -530,7 +553,8 @@ class FilteredMhcDataset(BaseMhcDataset):
             root_dir=root_dir,
             include_mask=include_mask,
             feature_indices=feature_indices,
-            feature_stats=feature_stats
+            feature_stats=feature_stats,
+            postprocessors=postprocessors
         )
 
         # Store the label of interest for reference
@@ -553,7 +577,8 @@ class FlattenedMhcDataset(BaseMhcDataset):
                  root_dir: str,
                  include_mask: bool = False,
                  feature_indices: Optional[List[int]] = None,
-                 feature_stats: Optional[dict] = None):
+                 feature_stats: Optional[dict] = None,
+                 postprocessors: Optional[List[Callable]] = None):
         """
         Initializes the FlattenedMhcDataset. Arguments are passed directly
         to the BaseMhcDataset constructor.
@@ -564,12 +589,14 @@ class FlattenedMhcDataset(BaseMhcDataset):
             include_mask (bool): Whether to load and include a mask channel.
             feature_indices (Optional[List[int]]): Optional list of feature indices.
             feature_stats (Optional[dict]): Optional dictionary for feature standardization.
+            postprocessors (Optional[List[Callable]]): Postprocessors passed to BaseMhcDataset.
         """
         super().__init__(dataframe=dataframe,
                          root_dir=root_dir,
                          include_mask=include_mask,
                          feature_indices=feature_indices,
-                         feature_stats=feature_stats)
+                         feature_stats=feature_stats,
+                         postprocessors=postprocessors)
         logger.info("Initialized FlattenedMhcDataset. Output data/mask shape will be (num_features, num_days * 1440).")
 
     def __getitem__(self, idx):
@@ -644,7 +671,8 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
                  overlap: int = 0,
                  include_mask: bool = False,
                  feature_indices: Optional[List[int]] = None,
-                 feature_stats: Optional[dict] = None):
+                 feature_stats: Optional[dict] = None,
+                 postprocessors: Optional[List[Callable]] = None):
         """
         Args:
             dataframe (pd.DataFrame): The denormalized dataframe.
@@ -660,6 +688,7 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
                                                     Passed to BaseMhcDataset.
             feature_stats (Optional[dict]): Optional dictionary for feature standardization.
                                             Passed to BaseMhcDataset.
+            postprocessors (Optional[List[Callable]]): Postprocessors passed to BaseMhcDataset.
         """
         # --- Parameter Validation ---
         if not isinstance(sequence_len, int) or sequence_len <= 0:
@@ -702,7 +731,8 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
             root_dir=root_dir,
             include_mask=include_mask,
             feature_indices=feature_indices,
-            feature_stats=feature_stats
+            feature_stats=feature_stats,
+            postprocessors=postprocessors
         )
         logger.info(f"Initialized ForecastingEvaluationDataset with sequence_len={sequence_len}, "
                     f"prediction_horizon={prediction_horizon}, overlap={overlap}.")
@@ -799,7 +829,6 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
 
         return result_dict
 
-
 class FlattenedForecastingDataset(FlattenedMhcDataset):
     """
     A subclass of FlattenedMhcDataset designed for forecasting tasks with flattened data.
@@ -827,7 +856,8 @@ class FlattenedForecastingDataset(FlattenedMhcDataset):
                  overlap: int = 0,
                  include_mask: bool = False,
                  feature_indices: Optional[List[int]] = None,
-                 feature_stats: Optional[dict] = None):
+                 feature_stats: Optional[dict] = None,
+                 postprocessors: Optional[List[Callable]] = None):
         """
         Args:
             dataframe (pd.DataFrame): The denormalized dataframe.
@@ -843,6 +873,7 @@ class FlattenedForecastingDataset(FlattenedMhcDataset):
                                                     Passed to FlattenedMhcDataset.
             feature_stats (Optional[dict]): Optional dictionary for feature standardization.
                                             Passed to FlattenedMhcDataset.
+            postprocessors (Optional[List[Callable]]): Postprocessors passed to FlattenedMhcDataset.
         """
         # --- Parameter Validation ---
         if not isinstance(sequence_len, int) or sequence_len <= 0:
@@ -877,7 +908,8 @@ class FlattenedForecastingDataset(FlattenedMhcDataset):
             root_dir=root_dir,
             include_mask=include_mask,
             feature_indices=feature_indices,
-            feature_stats=feature_stats
+            feature_stats=feature_stats,
+            postprocessors=postprocessors
         )
         logger.info(f"Initialized FlattenedForecastingDataset with sequence_len={sequence_len}, "
                     f"prediction_horizon={prediction_horizon}, overlap={overlap}.")

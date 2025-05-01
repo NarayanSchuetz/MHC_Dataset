@@ -2,12 +2,9 @@ import unittest
 import pandas as pd
 import numpy as np
 import torch
-import os
 import tempfile
-import shutil
 from pathlib import Path
 from datetime import datetime, timedelta
-import warnings
 import logging # Import logging
 
 # Adjust import path based on your project structure
@@ -216,11 +213,14 @@ class TestMhcDatasets(unittest.TestCase):
         torch.testing.assert_close(sample['mask'][0], expected_mask1)
         torch.testing.assert_close(sample['mask'][1], expected_mask2)
 
-        # Check data is still correct
+        # Check data is still correct - but account for masking in BaseMhcDataset.__getitem__
         expected_day1 = torch.from_numpy(self.day1_p1_data[1, :, :])
         expected_day2 = torch.from_numpy(self.day2_p1_data[1, :, :])
-        torch.testing.assert_close(sample['data'][0], expected_day1)
-        torch.testing.assert_close(sample['data'][1], expected_day2)
+        # Apply the mask to the expected data
+        expected_day1_masked = expected_day1 * expected_mask1
+        expected_day2_masked = expected_day2 * expected_mask2
+        torch.testing.assert_close(sample['data'][0], expected_day1_masked)
+        torch.testing.assert_close(sample['data'][1], expected_day2_masked)
 
     def test_base_getitem_missing_day_in_range(self):
         """Test __getitem__ handles missing days within the time range."""
@@ -236,8 +236,13 @@ class TestMhcDatasets(unittest.TestCase):
         expected_day2 = torch.from_numpy(self.day2_p1_data[1, :, :])
         expected_mask1 = torch.from_numpy(self.day1_p1_data[0, :, :])
         expected_mask2 = torch.from_numpy(self.day2_p1_data[0, :, :])
-        torch.testing.assert_close(sample['data'][0], expected_day1)
-        torch.testing.assert_close(sample['data'][1], expected_day2)
+        
+        # Apply masks to data since BaseMhcDataset.__getitem__ does this
+        expected_day1_masked = expected_day1 * expected_mask1
+        expected_day2_masked = expected_day2 * expected_mask2
+        
+        torch.testing.assert_close(sample['data'][0], expected_day1_masked)
+        torch.testing.assert_close(sample['data'][1], expected_day2_masked)
         torch.testing.assert_close(sample['mask'][0], expected_mask1)
         torch.testing.assert_close(sample['mask'][1], expected_mask2)
 
@@ -261,7 +266,11 @@ class TestMhcDatasets(unittest.TestCase):
         # Check day 1 (present)
         expected_day1_p2 = torch.from_numpy(self.day1_p2_data[1, :, :])
         expected_mask1_p2 = torch.from_numpy(self.day1_p2_data[0, :, :]) # Assume mask at index 0 for P2 as well
-        torch.testing.assert_close(sample['data'][0], expected_day1_p2)
+        
+        # Apply mask to data since BaseMhcDataset.__getitem__ does this
+        expected_day1_p2_masked = expected_day1_p2 * expected_mask1_p2
+        
+        torch.testing.assert_close(sample['data'][0], expected_day1_p2_masked)
         torch.testing.assert_close(sample['mask'][0], expected_mask1_p2)
 
 
@@ -723,12 +732,18 @@ class TestMhcDatasets(unittest.TestCase):
          exp_day1_f5 = (orig_day1_f5 - mean5) / std5
          exp_day2_f0 = (orig_day2_f0 - mean0) / std0
          exp_day2_f5 = (orig_day2_f5 - mean5) / std5
+         
+         # Apply mask to standardized data
+         exp_day1_f0_masked = exp_day1_f0 * orig_mask1_f0
+         exp_day1_f5_masked = exp_day1_f5 * orig_mask1_f5
+         exp_day2_f0_masked = exp_day2_f0 * orig_mask2_f0
+         exp_day2_f5_masked = exp_day2_f5 * orig_mask2_f5
 
          # Check data (selected order [0, 5] maps to output [0, 1])
-         torch.testing.assert_close(sample0['data'][0, 0, :], torch.from_numpy(exp_day1_f0)) # Output 0 <- Original 0
-         torch.testing.assert_close(sample0['data'][0, 1, :], torch.from_numpy(exp_day1_f5)) # Output 1 <- Original 5
-         torch.testing.assert_close(sample0['data'][1, 0, :], torch.from_numpy(exp_day2_f0))
-         torch.testing.assert_close(sample0['data'][1, 1, :], torch.from_numpy(exp_day2_f5))
+         torch.testing.assert_close(sample0['data'][0, 0, :], torch.from_numpy(exp_day1_f0_masked)) # Output 0 <- Original 0
+         torch.testing.assert_close(sample0['data'][0, 1, :], torch.from_numpy(exp_day1_f5_masked)) # Output 1 <- Original 5
+         torch.testing.assert_close(sample0['data'][1, 0, :], torch.from_numpy(exp_day2_f0_masked))
+         torch.testing.assert_close(sample0['data'][1, 1, :], torch.from_numpy(exp_day2_f5_masked))
 
          # Check mask (should be selected but not standardized)
          torch.testing.assert_close(sample0['mask'][0, 0, :], torch.from_numpy(orig_mask1_f0))
@@ -1301,7 +1316,7 @@ class TestFlattenedMhcDataset(unittest.TestCase):
             ],
             'file_uris': [
                 ["healthCode1/2023-03-01.npy", "healthCode1/2023-03-02.npy"], 
-                ["healthCode1/2023-03-01.npy", "healthCode1/2023-03-01.npy"], 
+                ["healthCode1/2023-03-01.npy"], 
                 ["healthCode1/2023-03-01.npy", "healthCode1/2023-03-02.npy"]
             ],
             'labelA_value': [1.0, 2.0, 3.0]
@@ -1390,10 +1405,15 @@ class TestFlattenedMhcDataset(unittest.TestCase):
         self.assertEqual(sample['data'].shape, (self.raw_features, 1 * self.time_points))
         self.assertEqual(sample['mask'].shape, (self.raw_features, 1 * self.time_points))
 
-        # Check data and mask content
+        # Check data and mask content using the data that's actually in the file
         orig_day1_data = torch.from_numpy(self.day1_data[0])
         orig_day1_mask = torch.from_numpy(self.day1_mask)
-        torch.testing.assert_close(sample['data'], orig_day1_data)
+        
+        # Apply the mask to the original data, since the dataset does this in __getitem__
+        # BaseMhcDataset.__getitem__ applies: result_dict['data'] = result_dict['data'] * result_dict['mask']
+        expected_data = orig_day1_data * orig_day1_mask
+        
+        torch.testing.assert_close(sample['data'], expected_data)
         torch.testing.assert_close(sample['mask'], orig_day1_mask)
 
     def test_flattened_with_feature_selection(self):
@@ -1480,9 +1500,13 @@ class TestFlattenedMhcDataset(unittest.TestCase):
         orig_day1_mask = torch.from_numpy(self.day1_mask)
         orig_day2_mask = torch.from_numpy(self.day2_mask)
 
+        # Apply masks to data since BaseMhcDataset.__getitem__ does this
+        expected_day1_data = orig_day1_data * orig_day1_mask
+        expected_day2_data = orig_day2_data * orig_day2_mask
+
         # Check first two days' data/mask
-        torch.testing.assert_close(sample['data'][:, :self.time_points], orig_day1_data)
-        torch.testing.assert_close(sample['data'][:, self.time_points:2*self.time_points], orig_day2_data)
+        torch.testing.assert_close(sample['data'][:, :self.time_points], expected_day1_data)
+        torch.testing.assert_close(sample['data'][:, self.time_points:2*self.time_points], expected_day2_data)
         torch.testing.assert_close(sample['mask'][:, :self.time_points], orig_day1_mask)
         torch.testing.assert_close(sample['mask'][:, self.time_points:2*self.time_points], orig_day2_mask)
 

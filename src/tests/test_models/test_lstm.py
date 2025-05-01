@@ -2,7 +2,6 @@ import pytest
 import torch
 import numpy as np
 from src.models.lstm import AutoencoderLSTM, RevInAutoencoderLSTM
-from src.models.revin import RevIN # Keep this import for direct RevIN tests if needed
 
 
 class TestAutoencoderLSTM:
