@@ -1,7 +1,6 @@
 import torch
 from typing import List, Tuple, Optional, Dict, Any, Callable, Union
 import logging
-from constants import HKQuantityType
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -206,72 +205,82 @@ class CustomMaskPostprocessor:
         num_days, num_features, num_time_points = data_tensor.shape
         device = data_tensor.device
 
-        # --- Initialize Final Mask ---
+        # --- Initialize Final Mask (Always start fresh) ---
+        # Create a new mask filled with ones (all valid)
+        final_mask = torch.ones_like(data_tensor, dtype=torch.float32, device=device)
+        
+        # --- Determine Initial Mask State for Checks ---
+        # Use the original mask if available and valid, otherwise assume all valid initially.
+        initial_mask_state_used_for_checks = torch.ones_like(data_tensor, dtype=torch.bool, device=device) # Assume all valid initially
         if original_mask is not None:
-            if not isinstance(original_mask, torch.Tensor) or original_mask.shape != data_tensor.shape:
+            if isinstance(original_mask, torch.Tensor) and original_mask.shape == data_tensor.shape:
+                 # Use the provided original mask state (0 means masked)
+                 initial_mask_state_used_for_checks = (original_mask == 0)
+            else:
                  logger.warning(f"CustomMaskPostprocessor found original mask shape "
                                 f"{original_mask.shape if isinstance(original_mask, torch.Tensor) else 'Non-tensor'} "
-                                f"inconsistent with data shape {data_tensor.shape}. Creating new 'all valid' mask.")
-                 final_mask = torch.ones_like(data_tensor, dtype=torch.float32, device=device)
-            else:
-                 # Ensure mask is float, on the correct device, and work on a copy
-                 final_mask = original_mask.clone().to(dtype=torch.float32, device=device)
-        else:
-            # Create a new mask if one wasn't provided by the base dataset
-            logger.debug("No input mask tensor found in sample. Creating a new mask.")
-            final_mask = torch.ones_like(data_tensor, dtype=torch.float32, device=device)
+                                f"inconsistent with data shape {data_tensor.shape}. Proceeding as if no initial mask was provided.")
+        
+        is_masked_initial = initial_mask_state_used_for_checks # Shape (D, F, T) - True where initially masked
 
-        # --- Pre-calculations ---
-        # Rule assumes 0 represents missing/invalid data for gap checks.
-        # BaseMhcDataset already converts NaNs to 0.0 before returning.
-        is_zero = (data_tensor == 0) # Shape (D, F, T)
-
-        # --- 1. Consecutive Zeros Across All Channels ---
-        # Mask time points where ALL features are zero for >= threshold duration
-        all_features_zero = is_zero.all(dim=1) # Shape (D, T)
+        # --- 1. Consecutive Masked Regions Across All Channels ---
+        # Check where ALL features were masked in the initial state for >= threshold duration
+        all_features_masked = is_masked_initial.all(dim=1) # Shape (D, T)
         for d in range(num_days):
-            runs = find_consecutive_runs(all_features_zero[d], min_length=self.consecutive_zero_threshold)
+            # Find runs where all features were initially masked
+            runs = find_consecutive_runs(all_features_masked[d], min_length=self.consecutive_zero_threshold)
+            # Apply the mask modification to the final_mask
             for start, end in runs:
-                if start < end: final_mask[d, :, start:end] = 0
+                if start < end: 
+                    logger.debug(f"Masking region Day {d} {start}-{end} due to all features being masked initially.")
+                    final_mask[d, :, start:end] = 0 # Set region in final_mask to 0
 
-        # --- 2. Missing Channels ---
-        # Mask features that are zero across ALL days and time points
-        channel_is_missing = is_zero.all(dim=0).all(dim=1) # Shape (F,)
+        # --- 2. Fully Masked Channels ---
+        # Check if features were masked across ALL days and time points in the initial state
+        # Or if channels were fully masked for at least one complete day in the initial state
+        channel_is_fully_masked_initial = is_masked_initial.all(dim=0).all(dim=1) # Shape (F,) based on initial mask
+        day_level_masked_initial = is_masked_initial.all(dim=2) # Shape (D, F) based on initial mask
+        channel_is_masked_any_day_initial = day_level_masked_initial.any(dim=0) # Shape (F,)
         
-        # Check if any channels are all zero for at least one specific day
-        # Can be configured to be more strict if needed
-        day_level_missing = is_zero.all(dim=2) # Shape (D, F)
-        channel_is_missing_any_day = day_level_missing.any(dim=0) # Shape (F,)
+        # Combine conditions based on initial mask state
+        combined_masked_initial = channel_is_fully_masked_initial | channel_is_masked_any_day_initial
         
-        # Combine both conditions (all zeros across all days OR all zeros in any single day)
-        combined_missing = channel_is_missing | channel_is_missing_any_day
-        
-        missing_channel_indices = combined_missing.nonzero(as_tuple=False).squeeze(-1)
+        missing_channel_indices = combined_masked_initial.nonzero(as_tuple=False).squeeze(-1)
         if len(missing_channel_indices) > 0:
             missing_indices_list = missing_channel_indices.tolist()
             if isinstance(missing_indices_list, int): missing_indices_list = [missing_indices_list]
-            logger.debug(f"Masking completely missing channels: indices {missing_indices_list}")
-            final_mask[:, missing_channel_indices, :] = 0
+            logger.debug(f"Masking initially fully masked channels: indices {missing_indices_list}")
+            # Apply the mask modification to the final_mask
+            final_mask[:, missing_channel_indices, :] = 0 # Set channel in final_mask to 0
 
-        # --- 3. Heart Rate Gaps ---
-        # Calculate the HR index within *this specific sample's* features
+        # --- 3. Heart Rate Gaps (Based on Initial Mask) ---
+        # Calculate the HR index within *this specific sample\'s* features
         hr_index_in_data = self._calculate_hr_index_in_data(num_features, feature_indices)
 
         if hr_index_in_data is not None:
-            # Only process if the channel wasn't already marked as completely missing
-            if not (hr_index_in_data < len(channel_is_missing) and channel_is_missing[hr_index_in_data]):
-                hr_is_zero = is_zero[:, hr_index_in_data, :] # Shape (D, T)
+            # Check if this channel was already identified as fully masked based on the initial state
+            is_hr_channel_fully_masked = combined_masked_initial[hr_index_in_data].item() if hr_index_in_data < len(combined_masked_initial) else False
+
+            if not is_hr_channel_fully_masked:
+                # Check the initial mask state for the HR channel
+                hr_is_masked_initial = is_masked_initial[:, hr_index_in_data, :] # Shape (D, T)
                 for d in range(num_days):
-                    runs = find_consecutive_runs(hr_is_zero[d], min_length=self.hr_gap_threshold)
+                    # Find runs where HR was initially masked
+                    runs = find_consecutive_runs(hr_is_masked_initial[d], min_length=self.hr_gap_threshold)
+                    # Apply the mask modification to the final_mask
                     for start, end in runs:
                         if start < end: 
-                            logger.debug(f"Masking HR gap on day {d} from {start} to {end}")
-                            final_mask[d, hr_index_in_data, start:end] = 0
+                            logger.debug(f"Masking HR gap on day {d} from {start} to {end} based on initial mask.")
+                            final_mask[d, hr_index_in_data, start:end] = 0 # Set HR gap in final_mask to 0
             else:
-                logger.debug(f"HR channel ({hr_index_in_data}) already masked as missing. Skipping HR gap check.")
+                logger.debug(f"HR channel ({hr_index_in_data}) already masked based on initial state. Skipping HR gap check.")
 
         # --- Update Sample ---
-        sample['mask'] = final_mask
+        # Ensure data is zero where the final mask is zero
+        # Apply this *after* all masking rules have been processed
+        data_tensor = data_tensor * final_mask # Element-wise multiplication
+        sample['data'] = data_tensor
+        sample['mask'] = final_mask # Assign the newly created mask
         return sample
 
 

@@ -393,25 +393,6 @@ class BaseMhcDataset(Dataset):
                 logger.debug(f"Sample {idx}: Selected features. New data shape: {stacked_data_array.shape}")
 
 
-            # ---> 4c. Apply feature-wise standardization (using remapped stats) <---
-            if self._remapped_feature_stats is not None:
-                # Data shape is now (num_days, num_selected_features, 1440)
-                current_num_features = stacked_data_array.shape[1]
-                for remapped_feature_idx, (mean, std) in self._remapped_feature_stats.items():
-                    # remapped_feature_idx is the index in the *selected* feature array
-                    if remapped_feature_idx < 0 or remapped_feature_idx >= current_num_features:
-                        # This check should theoretically be redundant due to validation in __init__
-                        logger.warning(f"Remapped feature index {remapped_feature_idx} out of bounds for data with {current_num_features} selected features (Sample {idx}). Skipping standardization for this feature.")
-                        continue
-                    # Avoid division by zero or near-zero std dev
-                    if std is None or abs(std) < 1e-9:
-                         logger.warning(f"Standard deviation for feature index {remapped_feature_idx} is zero or too small ({std}). Skipping standardization for this feature.")
-                         continue
-                    # Standardize this feature across all days and time points
-                    stacked_data_array[:, remapped_feature_idx, :] = (stacked_data_array[:, remapped_feature_idx, :] - mean) / std
-                logger.debug(f"Sample {idx}: Applied standardization to {len(self._remapped_feature_stats)} features.")
-
-
             # ---> 4d. Convert final arrays to tensors <---
             result_dict['data'] = torch.from_numpy(stacked_data_array.copy()) # Use copy for safety
 
@@ -464,6 +445,26 @@ class BaseMhcDataset(Dataset):
                      raise RuntimeError(f"Postprocessor {type(processor).__name__} failed for sample {idx}") from e
              else:
                  logger.warning(f"Item in postprocessors list is not callable: {type(processor)}. Skipping.")
+
+        # Apply feature-wise standardization (using remapped stats)
+        if self._remapped_feature_stats is not None and 'data' in result_dict:
+            stacked_data_array = result_dict['data'].numpy()
+            # Data shape is now (num_days, num_selected_features, 1440)
+            current_num_features = stacked_data_array.shape[1]
+            for remapped_feature_idx, (mean, std) in self._remapped_feature_stats.items():
+                # remapped_feature_idx is the index in the *selected* feature array
+                if remapped_feature_idx < 0 or remapped_feature_idx >= current_num_features:
+                    # This check should theoretically be redundant due to validation in __init__
+                    logger.warning(f"Remapped feature index {remapped_feature_idx} out of bounds for data with {current_num_features} selected features (Sample {idx}). Skipping standardization for this feature.")
+                    continue
+                # Avoid division by zero or near-zero std dev
+                if std is None or abs(std) < 1e-9:
+                     logger.warning(f"Standard deviation for feature index {remapped_feature_idx} is zero or too small ({std}). Skipping standardization for this feature.")
+                     continue
+                # Standardize this feature across all days and time points
+                stacked_data_array[:, remapped_feature_idx, :] = (stacked_data_array[:, remapped_feature_idx, :] - mean) / std
+            logger.debug(f"Sample {idx}: Applied standardization to {len(self._remapped_feature_stats)} features.")
+            result_dict['data'] = torch.from_numpy(stacked_data_array.copy())
 
         # Apply mask to data: explicitly zero out data values where mask is 0
         if 'data' in result_dict and 'mask' in result_dict:
