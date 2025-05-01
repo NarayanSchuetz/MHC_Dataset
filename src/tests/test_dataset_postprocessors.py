@@ -133,9 +133,10 @@ def test_custom_mask_rule1_consecutive_zeros(base_sample):
     assert final_mask[1, 2, 49] == 1
     assert final_mask[1, 0, 65] == 1
     assert final_mask[1, 2, 65] == 1
-    # Check the short gap IS NOT masked by rule 1 (below threshold)
-    assert final_mask[0, 0, 80:85].all()
-    assert final_mask[0, 2, 80:85].all()
+    # Check the short gap remains masked in the final output
+    # (The processor preserves all initially masked regions, regardless of length)
+    assert (final_mask[0, 0, 80:85] == 0).all()
+    assert (final_mask[0, 2, 80:85] == 0).all()
 
 def test_custom_mask_rule2_missing_channels(base_sample):
     processor = CustomMaskPostprocessor()
@@ -169,11 +170,10 @@ def test_custom_mask_rule3_hr_gaps(base_sample):
     assert final_mask[0, hr_original_index, 9] == 1
     assert final_mask[0, hr_original_index, 50] == 1
     
-    # Check short gap is not applied to the final mask by the processor
-    # Since the gap (20) is below threshold (30), the processor doesn't add masking
-    # However, since we're now creating completely new masks, the shorter pre-masked region
-    # won't be in the output mask
-    assert (final_mask[1, hr_original_index, 70:90] == 1).all()
+    # Check short gap remains masked in the final output
+    # (The processor preserves all initially masked regions, regardless of length,
+    # even though this gap is shorter than the HR_GAP_THRESHOLD of 30)
+    assert (final_mask[1, hr_original_index, 70:90] == 0).all()
 
 def test_custom_mask_with_feature_selection(base_sample_with_selection):
     # Original HR index 4 -> Selected index 2

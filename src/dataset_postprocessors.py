@@ -63,6 +63,81 @@ def find_consecutive_runs(bool_tensor_1d: torch.Tensor, min_length: int) -> List
 
     return runs
 
+def _vectorized_interpolate(data_1d: torch.Tensor, 
+                           mask_1d: torch.Tensor, 
+                           gap_start: int, 
+                           gap_end: int,
+                           valid_indices: torch.Tensor,
+                           valid_values: torch.Tensor,
+                           method: str = 'linear') -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Performs vectorized interpolation on a 1D tensor segment (in-place for data, returns updated mask).
+
+    Args:
+        data_1d: The 1D data tensor for the day (modified in-place).
+        mask_1d: The 1D mask tensor for the day (used for finding boundaries, returned modified).
+        gap_start: Start index of the zero-data gap.
+        gap_end: End index (exclusive) of the zero-data gap.
+        valid_indices: Tensor containing indices of valid (non-zero and unmasked) points in data_1d.
+        valid_values: Tensor containing values at valid_indices.
+        method: Interpolation method ('linear' or 'nearest').
+
+    Returns:
+        Tuple: (data_1d, updated_mask_1d) - data is modified in-place, mask is returned.
+    """
+    
+    # --- Find nearest valid boundary indices ---
+    before_idx_candidates = valid_indices[valid_indices < gap_start]
+    after_idx_candidates = valid_indices[valid_indices >= gap_end]
+
+    before_idx = before_idx_candidates.max() if len(before_idx_candidates) > 0 else -1
+    after_idx = after_idx_candidates.min() if len(after_idx_candidates) > 0 else -1
+
+    # --- Handle edge cases and perform interpolation ---
+    gap_indices = torch.arange(gap_start, gap_end, device=data_1d.device)
+    
+    can_interpolate = False
+    if before_idx != -1 and after_idx != -1:
+        # --- Both boundaries exist ---
+        before_val = data_1d[before_idx]
+        after_val = data_1d[after_idx]
+        
+        if method == 'linear':
+            # Avoid division by zero if indices are the same (shouldn't happen with valid points)
+            denominator = (after_idx - before_idx).float()
+            if denominator > 1e-6: 
+                weight = (gap_indices - before_idx).float() / denominator
+                interp_values = before_val * (1 - weight) + after_val * weight
+                data_1d[gap_start:gap_end] = interp_values
+                can_interpolate = True
+            else: # Fallback if indices are identical or too close
+                 data_1d[gap_start:gap_end] = before_val 
+                 can_interpolate = True
+
+        elif method == 'nearest':
+            dist_before = gap_indices - before_idx
+            dist_after = after_idx - gap_indices
+            interp_values = torch.where(dist_before <= dist_after, before_val, after_val)
+            data_1d[gap_start:gap_end] = interp_values
+            can_interpolate = True
+            
+    elif before_idx != -1:
+        # --- Only boundary before exists ---
+        data_1d[gap_start:gap_end] = data_1d[before_idx]
+        can_interpolate = True
+        
+    elif after_idx != -1:
+        # --- Only boundary after exists ---
+        data_1d[gap_start:gap_end] = data_1d[after_idx]
+        can_interpolate = True
+
+    # --- Mask if interpolation wasn't possible or if boundaries didn't exist ---
+    if not can_interpolate:
+        mask_1d[gap_start:gap_end] = 0
+        # Ensure data is also zero where mask is zero (might already be, but safety)
+        data_1d[gap_start:gap_end] = 0 
+        
+    return data_1d, mask_1d
 
 class CustomMaskPostprocessor:
     """
@@ -205,26 +280,30 @@ class CustomMaskPostprocessor:
         num_days, num_features, num_time_points = data_tensor.shape
         device = data_tensor.device
 
-        # --- Initialize Final Mask (Always start fresh) ---
-        # Create a new mask filled with ones (all valid)
-        final_mask = torch.ones_like(data_tensor, dtype=torch.float32, device=device)
-        
-        # --- Determine Initial Mask State for Checks ---
-        # Use the original mask if available and valid, otherwise assume all valid initially.
-        initial_mask_state_used_for_checks = torch.ones_like(data_tensor, dtype=torch.bool, device=device) # Assume all valid initially
+        # --- Initialize Final Mask ---
         if original_mask is not None:
-            if isinstance(original_mask, torch.Tensor) and original_mask.shape == data_tensor.shape:
-                 # Use the provided original mask state (0 means masked)
-                 initial_mask_state_used_for_checks = (original_mask == 0)
-            else:
+            if not isinstance(original_mask, torch.Tensor) or original_mask.shape != data_tensor.shape:
                  logger.warning(f"CustomMaskPostprocessor found original mask shape "
                                 f"{original_mask.shape if isinstance(original_mask, torch.Tensor) else 'Non-tensor'} "
-                                f"inconsistent with data shape {data_tensor.shape}. Proceeding as if no initial mask was provided.")
-        
-        is_masked_initial = initial_mask_state_used_for_checks # Shape (D, F, T) - True where initially masked
+                                f"inconsistent with data shape {data_tensor.shape}. Creating new 'all valid' mask.")
+                 final_mask = torch.ones_like(data_tensor, dtype=torch.float32, device=device)
+            else:
+                 # Ensure mask is float, on the correct device, and work on a copy
+                 final_mask = original_mask.clone().to(dtype=torch.float32, device=device)
+        else:
+            # Create a new mask if one wasn't provided by the base dataset
+            logger.debug("No input mask tensor found in sample. Creating a new mask.")
+            final_mask = torch.ones_like(data_tensor, dtype=torch.float32, device=device)
+
+        # --- Pre-calculations ---
+        # Create a copy of the initial mask state to base calculations on
+        initial_mask_state = final_mask.clone()
+        # Determine where the *initial* mask indicates masked data (mask == 0)
+        is_masked_initial = (initial_mask_state == 0) # Shape (D, F, T)
 
         # --- 1. Consecutive Masked Regions Across All Channels ---
-        # Check where ALL features were masked in the initial state for >= threshold duration
+        # Mask time points where ALL features are already masked for >= threshold duration
+        # Use the initial mask state for this check
         all_features_masked = is_masked_initial.all(dim=1) # Shape (D, T)
         for d in range(num_days):
             # Find runs where all features were initially masked
@@ -233,11 +312,11 @@ class CustomMaskPostprocessor:
             for start, end in runs:
                 if start < end: 
                     logger.debug(f"Masking region Day {d} {start}-{end} due to all features being masked initially.")
-                    final_mask[d, :, start:end] = 0 # Set region in final_mask to 0
+                    final_mask[d, :, start:end] = 0
 
         # --- 2. Fully Masked Channels ---
-        # Check if features were masked across ALL days and time points in the initial state
-        # Or if channels were fully masked for at least one complete day in the initial state
+        # Mask features that are already masked across ALL days and time points in the initial mask
+        # Or channels that are fully masked for at least one complete day in the initial mask
         channel_is_fully_masked_initial = is_masked_initial.all(dim=0).all(dim=1) # Shape (F,) based on initial mask
         day_level_masked_initial = is_masked_initial.all(dim=2) # Shape (D, F) based on initial mask
         channel_is_masked_any_day_initial = day_level_masked_initial.any(dim=0) # Shape (F,)
@@ -251,10 +330,10 @@ class CustomMaskPostprocessor:
             if isinstance(missing_indices_list, int): missing_indices_list = [missing_indices_list]
             logger.debug(f"Masking initially fully masked channels: indices {missing_indices_list}")
             # Apply the mask modification to the final_mask
-            final_mask[:, missing_channel_indices, :] = 0 # Set channel in final_mask to 0
+            final_mask[:, missing_channel_indices, :] = 0
 
         # --- 3. Heart Rate Gaps (Based on Initial Mask) ---
-        # Calculate the HR index within *this specific sample\'s* features
+        # Calculate the HR index within *this specific sample's* features
         hr_index_in_data = self._calculate_hr_index_in_data(num_features, feature_indices)
 
         if hr_index_in_data is not None:
@@ -271,7 +350,7 @@ class CustomMaskPostprocessor:
                     for start, end in runs:
                         if start < end: 
                             logger.debug(f"Masking HR gap on day {d} from {start} to {end} based on initial mask.")
-                            final_mask[d, hr_index_in_data, start:end] = 0 # Set HR gap in final_mask to 0
+                            final_mask[d, hr_index_in_data, start:end] = 0
             else:
                 logger.debug(f"HR channel ({hr_index_in_data}) already masked based on initial state. Skipping HR gap check.")
 
@@ -280,7 +359,7 @@ class CustomMaskPostprocessor:
         # Apply this *after* all masking rules have been processed
         data_tensor = data_tensor * final_mask # Element-wise multiplication
         sample['data'] = data_tensor
-        sample['mask'] = final_mask # Assign the newly created mask
+        sample['mask'] = final_mask
         return sample
 
 
@@ -331,15 +410,15 @@ class StripNansPostprocessor:
 
 class HeartRateInterpolationPostprocessor:
     """
-    A postprocessor that interpolates gaps in heart rate data.
+    A postprocessor that interpolates gaps in heart rate data using vectorized operations.
     
     Rules:
-    1. Only interpolate gaps smaller than HR_GAP_THRESHOLD (30 min by default)
-    2. Don't interpolate across already masked regions
-    3. Mask gaps larger than the threshold
+    1. Only interpolate gaps smaller than HR_GAP_THRESHOLD 
+    2. Only interpolate if the gap is within an initially unmasked region.
+    3. Mask gaps larger than the threshold or at the boundaries or without valid neighbors.
     
     Works on data that has already been processed by the BaseMhcDataset and
-    potentially the CustomMaskPostprocessor.
+    potentially the CustomMaskPostprocessor. Assumes data uses 0 for missing values.
     """
     
     # Default threshold in minutes (assuming 1 time point = 1 minute)
@@ -368,10 +447,8 @@ class HeartRateInterpolationPostprocessor:
         self.heart_rate_original_index = heart_rate_original_index
         self._expected_raw_features = expected_raw_features
         
-        # Set threshold, using class default if not provided
         self.hr_gap_threshold = hr_gap_threshold if hr_gap_threshold is not None else self.HR_GAP_THRESHOLD
         
-        # Set interpolation method
         valid_methods = ['linear', 'nearest']
         if interpolation_method not in valid_methods:
             logger.warning(f"Invalid interpolation_method: {interpolation_method}. Using 'linear' instead.")
@@ -379,7 +456,6 @@ class HeartRateInterpolationPostprocessor:
         else:
             self.interpolation_method = interpolation_method
             
-        # Validate HR index
         if not isinstance(self.heart_rate_original_index, int) or \
            not (0 <= self.heart_rate_original_index < self._expected_raw_features):
             raise ValueError(f"Invalid heart_rate_original_index: {self.heart_rate_original_index}. "
@@ -393,13 +469,6 @@ class HeartRateInterpolationPostprocessor:
     def _calculate_hr_index_in_data(self, num_features: int, feature_indices: Optional[List[int]]) -> Optional[int]:
         """
         Determines the index for HR within the current feature set.
-        
-        Args:
-            num_features: Number of features in the current tensor
-            feature_indices: List of feature indices that were selected from the original set, if any
-            
-        Returns:
-            The index of the heart rate feature in the current tensor, or None if not available
         """
         # If feature_indices were used for selection...
         if feature_indices is not None:
@@ -433,341 +502,112 @@ class HeartRateInterpolationPostprocessor:
                  logger.warning(f"Original HR index {self.heart_rate_original_index} is out of bounds "
                                 f"for data with {num_features} features.")
                  return None
-    
-    def _find_unmasked_regions(self, mask_tensor: torch.Tensor) -> List[List[Tuple[int, int]]]:
-        """
-        Identifies unmasked (valid) regions in a mask tensor.
-        
-        Args:
-            mask_tensor: The mask tensor, shape (D, T) for the HR channel only
-            
-        Returns:
-            List of lists, where each inner list contains (start, end) tuples for 
-            the unmasked regions in a day
-        """
-        # mask_tensor has shape (D, T) for HR channel only
-        # 1 = valid/unmasked, 0 = masked/invalid
-        num_days = mask_tensor.shape[0]
-        unmasked_regions = []
-        
-        for d in range(num_days):
-            # Find valid regions (mask == 1)
-            valid_mask = (mask_tensor[d] > 0.5)  # Use 0.5 threshold to handle potential float masks
-            # Get consecutive regions where mask is valid (1)
-            day_regions = find_consecutive_runs(valid_mask, min_length=1)
-            unmasked_regions.append(day_regions)
-            
-        return unmasked_regions
-    
-    def _interpolate_data(self, data_tensor: torch.Tensor, mask_tensor: torch.Tensor, 
-                          hr_index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Interpolates gaps in heart rate data and masks large gaps.
-        
-        Args:
-            data_tensor: The data tensor, shape (D, F, T)
-            mask_tensor: The mask tensor, shape (D, F, T)
-            hr_index: The index of the heart rate feature in the F dimension
-            
-        Returns:
-            Tuple of (updated data tensor, updated mask tensor)
-        """
-        num_days, num_features, num_time_points = data_tensor.shape
-        
-        # Extract HR data and mask
-        hr_data = data_tensor[:, hr_index, :].clone()  # Shape (D, T)
-        hr_mask = mask_tensor[:, hr_index, :].clone()  # Shape (D, T)
-        
-        # Find unmasked regions within each day
-        unmasked_regions = self._find_unmasked_regions(hr_mask)
-        
-        # For each day and each unmasked region in that day
-        for d in range(num_days):
-            day_regions = unmasked_regions[d]
-            
-            for start, end in day_regions:
-                # Get data within this contiguous unmasked region
-                region_data = hr_data[d, start:end]
-                region_mask = hr_mask[d, start:end]
-                
-                # Find zero (missing) values within this unmasked region
-                is_zero = (region_data == 0)
-                
-                if not is_zero.any():
-                    # No missing values in this region, continue to next region
-                    continue
-                
-                # Find runs of consecutive zeros
-                zero_runs = find_consecutive_runs(is_zero, min_length=1)
-                
-                # For each run of zeros, decide whether to interpolate or mask
-                for zero_start, zero_end in zero_runs:
-                    gap_length = zero_end - zero_start
-                    
-                    if gap_length >= self.hr_gap_threshold:
-                        # Gap too large to interpolate, mask it
-                        region_mask[zero_start:zero_end] = 0
-                        logger.debug(f"Masking large HR gap on day {d}, region {start}-{end}, gap {zero_start}-{zero_end} (length {gap_length})")
-                    else:
-                        # Gap small enough to interpolate
-                        
-                        # Special case: gap at the start or end of the region
-                        if zero_start == 0 or zero_end == len(region_data):
-                            # Can't interpolate at boundary - mask it
-                            region_mask[zero_start:zero_end] = 0
-                            logger.debug(f"Masking boundary HR gap on day {d}, region {start}-{end}, gap {zero_start}-{zero_end}")
-                            continue
-                        
-                        # Regular case: gap in the middle of valid data
-                        # Create index tensor for interpolation
-                        indices = torch.arange(len(region_data), device=region_data.device)
-                        
-                        # Find valid (non-zero) indices
-                        valid_indices = indices[~is_zero]
-                        valid_values = region_data[~is_zero]
-                        
-                        # Only interpolate if we have valid points before and after
-                        if len(valid_indices) >= 2:
-                            # Interpolate missing values
-                            gap_indices = indices[zero_start:zero_end]
-                            
-                            if self.interpolation_method == 'linear':
-                                # Linear interpolation
-                                interpolated_values = torch.zeros_like(gap_indices, dtype=torch.float32)
-                                
-                                for i, idx in enumerate(gap_indices):
-                                    # Find nearest valid points before and after
-                                    if idx <= valid_indices[0]:
-                                        # Use nearest if at/before first valid point
-                                        interpolated_values[i] = valid_values[0]
-                                    elif idx >= valid_indices[-1]:
-                                        # Use nearest if at/after last valid point
-                                        interpolated_values[i] = valid_values[-1]
-                                    else:
-                                        # Find indices of valid points just before and after
-                                        before_idx = valid_indices[valid_indices <= idx].max()
-                                        after_idx = valid_indices[valid_indices >= idx].min()
-                                        
-                                        if before_idx == after_idx:
-                                            # This shouldn't happen in proper linear interp but handle as safety
-                                            interpolated_values[i] = region_data[before_idx]
-                                        else:
-                                            # Calculate weights for linear interpolation
-                                            before_val = region_data[before_idx]
-                                            after_val = region_data[after_idx]
-                                            
-                                            # Linear interpolation formula
-                                            weight = (idx - before_idx) / (after_idx - before_idx)
-                                            interpolated_values[i] = before_val * (1 - weight) + after_val * weight
-                            
-                            elif self.interpolation_method == 'nearest':
-                                # Nearest neighbor interpolation
-                                interpolated_values = torch.zeros_like(gap_indices, dtype=torch.float32)
-                                
-                                for i, idx in enumerate(gap_indices):
-                                    # Find nearest valid point
-                                    distances = torch.abs(valid_indices - idx)
-                                    nearest_idx = valid_indices[distances.argmin()]
-                                    interpolated_values[i] = region_data[nearest_idx]
-                            
-                            # Place interpolated values back into the data
-                            region_data[zero_start:zero_end] = interpolated_values
-                            logger.debug(f"Interpolated HR gap on day {d}, region {start}-{end}, gap {zero_start}-{zero_end} (length {gap_length})")
-                        else:
-                            # Not enough valid points for interpolation, mask instead
-                            region_mask[zero_start:zero_end] = 0
-                            logger.debug(f"Masking HR gap (insufficient valid points) on day {d}, region {start}-{end}, gap {zero_start}-{zero_end}")
-                
-                # Update the original tensors with our modified region
-                hr_data[d, start:end] = region_data
-                hr_mask[d, start:end] = region_mask
-        
-        # Put the updated HR data and mask back into the full tensors
-        data_tensor_updated = data_tensor.clone()
-        mask_tensor_updated = mask_tensor.clone()
-        
-        data_tensor_updated[:, hr_index, :] = hr_data
-        mask_tensor_updated[:, hr_index, :] = hr_mask
-        
-        # Also zero out data where we've masked
-        data_tensor_updated[:, hr_index, :] = data_tensor_updated[:, hr_index, :] * mask_tensor_updated[:, hr_index, :]
-        
-        return data_tensor_updated, mask_tensor_updated
-    
+
     def __call__(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Applies heart rate interpolation to the sample data.
-        
-        Args:
-            sample: Dictionary containing at least 'data', 'mask', and 'metadata'
-            
-        Returns:
-            Updated sample dictionary with interpolated heart rate data
+        Applies heart rate interpolation using vectorized operations.
         """
-        # Extract components from sample
+        # --- Extract components & Validate ---
         data_tensor = sample.get('data')
         mask_tensor = sample.get('mask')
         metadata = sample.get('metadata', {})
         feature_indices = metadata.get('feature_indices')
         
-        # Input validation
-        if not isinstance(data_tensor, torch.Tensor):
-            logger.warning("HeartRateInterpolationPostprocessor expected tensor data. Skipping.")
-            return sample
-            
-        if data_tensor.ndim != 3:
-            logger.warning(f"HeartRateInterpolationPostprocessor expected 3D data tensor (D, F, T), got shape {data_tensor.shape}. Skipping.")
+        if not isinstance(data_tensor, torch.Tensor) or data_tensor.ndim != 3:
+            logger.warning(f"HR Interpolation: Invalid data tensor. Skipping.")
             return sample
             
         if mask_tensor is None or not isinstance(mask_tensor, torch.Tensor) or mask_tensor.shape != data_tensor.shape:
-            logger.warning("HeartRateInterpolationPostprocessor requires a valid mask tensor matching data shape. Skipping.")
+            logger.warning(f"HR Interpolation: Requires a valid mask tensor matching data shape. Skipping.")
             return sample
         
-        # Find the HR index in the current data
         num_days, num_features, num_time_points = data_tensor.shape
         hr_index = self._calculate_hr_index_in_data(num_features, feature_indices)
         
         if hr_index is None:
-            logger.warning("HeartRateInterpolationPostprocessor could not find heart rate feature in the data. Skipping.")
+            logger.warning("HR Interpolation: Could not find heart rate feature. Skipping.")
             return sample
-        
-        # Make copies of the tensors to avoid modifying the originals
+            
+        # --- Process HR data per day ---
+        # Work on copies to avoid modifying input tensors directly if used elsewhere
         updated_data = data_tensor.clone()
         updated_mask = mask_tensor.clone()
         
-        # For each day, process HR data
         for d in range(num_days):
             # Extract HR data and mask for this day
-            hr_data = updated_data[d, hr_index, :].clone()
-            hr_mask = updated_mask[d, hr_index, :].clone()
+            hr_data_day = updated_data[d, hr_index, :] 
+            hr_mask_day = updated_mask[d, hr_index, :]
             
-            # Find zero regions (gaps) in the data
-            is_zero = (hr_data == 0)
-            zero_runs = find_consecutive_runs(is_zero, min_length=1)
+            # Identify initial state: where data is zero AND mask is currently valid
+            is_zero = (hr_data_day == 0)
+            is_initially_valid_mask = (hr_mask_day > 0.5) # Use threshold for float masks
+            is_gap_to_process = is_zero & is_initially_valid_mask
             
-            for start, end in zero_runs:
+            if not is_gap_to_process.any():
+                continue # No gaps to process in initially valid regions for this day
+
+            # Find consecutive runs of potential gaps (zero data in initially valid mask regions)
+            gap_runs = find_consecutive_runs(is_gap_to_process, min_length=1)
+
+            if not gap_runs: # No runs found
+                continue
+
+            # Find all valid points (non-zero data AND valid mask) for boundary lookup
+            is_valid_point = (hr_data_day != 0) & is_initially_valid_mask
+            valid_indices = is_valid_point.nonzero(as_tuple=True)[0]  # Get indices as 1D tensor
+            valid_values = hr_data_day[valid_indices]  # Get corresponding values
+            
+            # Process each potential gap run
+            for start, end in gap_runs:
                 gap_length = end - start
                 
-                # Skip if the gap is already fully masked
-                if (hr_mask[start:end] == 0).all():
-                    continue
-                
-                # Check if this gap is fully at the start or end of the day
-                if start == 0 or end == num_time_points:
-                    # Can't interpolate at boundaries, so mask
-                    hr_mask[start:end] = 0
-                    continue
-                
+                # --- Rule 1: Mask large gaps ---
                 if gap_length >= self.hr_gap_threshold:
-                    # Gap too large to interpolate, mask it
-                    hr_mask[start:end] = 0
-                else:
-                    # Gap small enough to interpolate
-                    # Check if the gap contains any pre-masked regions
-                    masked_in_gap = (hr_mask[start:end] == 0).any()
-                    
-                    if masked_in_gap:
-                        # Handle segments separated by masked regions
-                        current_pos = start
-                        while current_pos < end:
-                            # Find the next masked region
-                            next_masked = current_pos
-                            while next_masked < end and hr_mask[next_masked] > 0:
-                                next_masked += 1
-                            
-                            # If we found a segment before masked region
-                            if next_masked > current_pos:
-                                segment_length = next_masked - current_pos
-                                # Only interpolate if segment is at least 1 point
-                                if segment_length >= 1:
-                                    # Perform proper interpolation for this segment
-                                    self._interpolate_segment(hr_data, current_pos, next_masked)
-                            
-                            # Skip over masked region
-                            current_pos = next_masked
-                            while current_pos < end and hr_mask[current_pos] == 0:
-                                current_pos += 1
-                    else:
-                        # No pre-masked regions in gap, simple case
-                        self._interpolate_segment(hr_data, start, end)
+                    hr_mask_day[start:end] = 0
+                    hr_data_day[start:end] = 0 # Ensure data is zeroed too
+                    logger.debug(f"HR Int: Masking large gap day {d}, {start}-{end} (len {gap_length})")
+                    continue # Move to next gap
+
+                # --- Rule 2: Mask boundary gaps (start/end of day) ---
+                # Check if valid points exist outside the gap boundaries
+                has_point_before = (valid_indices < start).any()
+                has_point_after = (valid_indices >= end).any()
+
+                # Important: Fix for the test case - mask gaps at the start of data
+                if start == 0:
+                    hr_mask_day[start:end] = 0
+                    hr_data_day[start:end] = 0
+                    logger.debug(f"HR Int: Masking start boundary gap day {d}, {start}-{end}")
+                    continue
+                elif end == num_time_points:
+                    hr_mask_day[start:end] = 0
+                    hr_data_day[start:end] = 0
+                    logger.debug(f"HR Int: Masking end boundary gap day {d}, {start}-{end}")
+                    continue
+                elif not has_point_before and not has_point_after:
+                    # Gap covers the whole day or is surrounded by masked/zero regions
+                    hr_mask_day[start:end] = 0
+                    hr_data_day[start:end] = 0
+                    logger.debug(f"HR Int: Masking gap with no valid neighbors day {d}, {start}-{end}")
+                    continue
+
+                # --- Rule 3: Interpolate small gaps ---
+                logger.debug(f"HR Int: Interpolating gap day {d}, {start}-{end} (len {gap_length})")
+                # _vectorized_interpolate modifies hr_data_day and hr_mask_day in-place/returns modified mask
+                hr_data_day, hr_mask_day = _vectorized_interpolate(
+                    hr_data_day, hr_mask_day, start, end, valid_indices, valid_values, 
+                    method=self.interpolation_method
+                )
             
-            # Update the tensors with our changes
-            updated_data[d, hr_index, :] = hr_data
-            updated_mask[d, hr_index, :] = hr_mask
-            # Zero out data in masked regions
-            updated_data[d, hr_index, :] = updated_data[d, hr_index, :] * updated_mask[d, hr_index, :]
-        
-        # Update the sample
+            # Ensure data is zero where the final mask is zero for this day
+            hr_data_day = hr_data_day * (hr_mask_day > 0.5).float()
+            
+            # Update the main tensors
+            updated_data[d, hr_index, :] = hr_data_day
+            updated_mask[d, hr_index, :] = hr_mask_day
+
+        # --- Update Sample ---
         sample['data'] = updated_data
         sample['mask'] = updated_mask
         
         return sample
-    
-    def _interpolate_segment(self, data: torch.Tensor, start: int, end: int) -> None:
-        """
-        Interpolates values in a segment of data (in-place).
-        
-        Args:
-            data: 1D tensor of data for one day and one feature
-            start: Start index of segment to interpolate
-            end: End index of segment to interpolate
-        """
-        # Find valid (non-zero) values before and after the segment
-        if start > 0:
-            # Find the closest non-zero value before the segment
-            before_idx = start - 1
-            before_val = data[before_idx]
-            while before_idx > 0 and before_val == 0:
-                before_idx -= 1
-                before_val = data[before_idx]
-        else:
-            # No valid point before, use the first after
-            before_idx = None
-            before_val = None
-        
-        if end < len(data):
-            # Find the closest non-zero value after the segment
-            after_idx = end
-            after_val = data[after_idx]
-            while after_idx < len(data) - 1 and after_val == 0:
-                after_idx += 1
-                after_val = data[after_idx]
-        else:
-            # No valid point after, use the last before
-            after_idx = None
-            after_val = None
-        
-        # Check if we have valid points for interpolation
-        if before_val is not None and before_val != 0 and after_val is not None and after_val != 0:
-            # Special case for constant values (like the test with all 50s)
-            if torch.isclose(before_val, after_val, rtol=1e-5):
-                # Use exact value for constant case
-                data[start:end] = before_val
-            else:
-                # Linear interpolation between two different valid points
-                if self.interpolation_method == 'linear':
-                    total_dist = after_idx - before_idx
-                    for i in range(start, end):
-                        # Calculate interpolation weight
-                        pos = i - before_idx
-                        weight = pos / total_dist
-                        # Linear interpolation formula
-                        data[i] = before_val * (1 - weight) + after_val * weight
-                elif self.interpolation_method == 'nearest':
-                    for i in range(start, end):
-                        # Find nearest point
-                        if (i - before_idx) <= (after_idx - i):
-                            data[i] = before_val  # Closer to before
-                        else:
-                            data[i] = after_val   # Closer to after
-        elif before_val is not None and before_val != 0:
-            # Only have valid point before, use that
-            data[start:end] = before_val
-        elif after_val is not None and after_val != 0:
-            # Only have valid point after, use that
-            data[start:end] = after_val
-        else:
-            # No valid points before or after, can't interpolate
-            # In a real implementation we might want to mask this,
-            # but for test compatibility we'll keep the zeros
-            pass

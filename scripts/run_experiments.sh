@@ -23,7 +23,6 @@ mkdir -p /scratch/users/schuetzn/data/mhc_dataset_out/lstm
 python3 scripts/lstm_experiment.py \
   --wandb_project MHC_Dataset \
   --wandb_entity schuetzn \
-  #--use_revin \
   --batch_size 128 \
   --num_epochs 100 \
   --lr 0.0001 \
@@ -41,4 +40,5 @@ python3 scripts/lstm_experiment.py \
   --num_workers 16 \
   --dataset_path /scratch/users/schuetzn/data/mhc_dataset_out/splits/train_final_dataset.parquet \
   --val_dataset_path /scratch/users/schuetzn/data/mhc_dataset_out/splits/validation_dataset.parquet \
-  --run_name "lstim_experiment_tf=1_hidden-dim=720_$(date +%Y%m%d_%H%M%S)"
+  --run_name "lstm_experiment_tf=1_hidden-dim=720_$(date +%Y%m%d_%H%M%S)" #\
+  #--use_revin

@@ -164,13 +164,17 @@ def main():
     label_cols = [col for col in train_df.columns if col.endswith('_value')]
     print(f"Available label columns: {label_cols}")
     
+    p0 = CustomMaskPostprocessor(heart_rate_original_index=5, expected_raw_features=6, consecutive_zero_threshold=30)
+    p1 = HeartRateInterpolationPostprocessor(heart_rate_original_index=5, expected_raw_features=6, hr_gap_threshold=30)
+
     # Create the datasets with mask
     train_dataset = BaseMhcDataset(
         train_df, 
         args.root_dir, 
         include_mask=True, 
         feature_stats=scaler_stats, 
-        feature_indices=list(range(args.num_features))
+        feature_indices=list(range(args.num_features)),
+        postprocessors=[p0, p1]
     )
     
     val_dataset = BaseMhcDataset(
@@ -178,7 +182,8 @@ def main():
         args.root_dir, 
         include_mask=True, 
         feature_stats=scaler_stats, 
-        feature_indices=list(range(args.num_features))
+        feature_indices=list(range(args.num_features)),
+        postprocessors=[p0, p1]
     )
     
     print(f"Created datasets with {len(train_dataset)} training and {len(val_dataset)} validation samples")
@@ -228,7 +233,7 @@ def main():
             bidirectional=args.bidirectional,
             target_labels=target_labels,
             prediction_horizon=args.prediction_horizon,
-            use_masked_loss=True,
+            use_masked_loss=False,
             teacher_forcing_ratio=args.initial_tf
         )
     
