@@ -8,6 +8,7 @@ from typing import List, Union, Tuple, Optional, Callable # Added Union, Tuple, 
 from datetime import datetime, timedelta # Added for date range handling
 import warnings # Add warnings import
 import logging # Add logging import
+import pickle # Add pickle import for caching
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -50,7 +51,9 @@ class BaseMhcDataset(Dataset):
                  include_mask: bool = False,
                  feature_indices: Optional[List[int]] = None,
                  feature_stats: Optional[dict] = None,
-                 postprocessors: Optional[List[Callable]] = None):
+                 postprocessors: Optional[List[Callable]] = None,
+                 use_cache: bool = False,
+                 force_recompute: bool = False):
         """
         Args:
             dataframe (pd.DataFrame): The denormalized dataframe.
@@ -71,6 +74,11 @@ class BaseMhcDataset(Dataset):
                                                        or instances with __call__) that will be applied
                                                        sequentially to the sample dictionary in __getitem__
                                                        after all other processing.
+            use_cache (bool): Whether to use caching for processed samples. If True, processed samples 
+                              will be saved to disk and loaded from cache in the same directory as the 
+                              source .npy files.
+            force_recompute (bool): If True, cached samples will be ignored and recomputed. New cache files
+                                   will still be saved if use_cache is True. Defaults to False.
         """
         super().__init__()
         if not isinstance(dataframe, pd.DataFrame):
@@ -161,6 +169,20 @@ class BaseMhcDataset(Dataset):
         self.root_dir = Path(os.path.expanduser(root_dir))
         self.include_mask = include_mask
         self.postprocessors = postprocessors if postprocessors is not None else [] # Store postprocessors
+        
+        # Caching setup
+        self.use_cache = use_cache
+        self.force_recompute = force_recompute
+        
+        if use_cache:
+            if force_recompute:
+                logger.info("Caching enabled, but force_recompute is True. Cached files will be regenerated.")
+            else:
+                logger.info("Caching enabled. Cache files will be stored alongside source files and used if available.")
+        else:
+            if force_recompute:
+                logger.warning("force_recompute is True but use_cache is False. Setting has no effect.")
+            logger.info("Caching disabled.")
 
         # Identify label columns
         self.label_cols = sorted([col for col in self.df.columns if col.endswith('_value')])
@@ -268,6 +290,92 @@ class BaseMhcDataset(Dataset):
         else:
             return data_placeholder
 
+    def _get_cache_path(self, idx: int, file_path: Path) -> Path:
+        """
+        Generate the file path for a cached sample. The cached file will be stored
+        in the same directory as the original source file.
+        
+        Args:
+            idx (int): The index of the sample.
+            file_path (Path): The path to the source .npy file to determine cache location.
+            
+        Returns:
+            Path: The path where the cached sample should be stored.
+        """
+        if not self.use_cache:
+            return None
+            
+        # Get class name
+        class_name = self.__class__.__name__
+        
+        # Get processor names if any
+        processor_names = []
+        for processor in self.postprocessors:
+            if hasattr(processor, '__name__'):
+                processor_names.append(processor.__name__)
+            else:
+                processor_names.append(processor.__class__.__name__)
+        
+        # Create cache identifier with class and processor names
+        cache_identifier = f"{class_name}"
+        if processor_names:
+            cache_identifier += "-" + "-".join(processor_names)
+            
+        # Use the directory of the source file
+        parent_dir = file_path.parent
+        
+        # Create a unique filename for this sample with class and processor info
+        filename = f"{file_path.stem}_cached-{cache_identifier}.pkl"
+        
+        return parent_dir / filename
+        
+    def _check_cache(self, idx: int, file_path: Path) -> Optional[dict]:
+        """
+        Check if a cached version of the sample exists and load it if so.
+        Will skip checking if force_recompute is True.
+        
+        Args:
+            idx (int): The index of the sample to check.
+            file_path (Path): The path to the source .npy file.
+            
+        Returns:
+            Optional[dict]: The cached sample dict if found, None otherwise.
+        """
+        if not self.use_cache or file_path is None or self.force_recompute:
+            return None
+            
+        cache_path = self._get_cache_path(idx, file_path)
+        if cache_path and cache_path.exists():
+            try:
+                with open(cache_path, 'rb') as f:
+                    cached_sample = pickle.load(f)
+                logger.debug(f"Loaded cached sample for index {idx} from {cache_path}")
+                return cached_sample
+            except Exception as e:
+                logger.warning(f"Failed to load cached sample for index {idx}: {e}")
+                return None
+        return None
+        
+    def _save_to_cache(self, idx: int, sample: dict, file_path: Path) -> None:
+        """
+        Save the processed sample to cache in the same directory as the source file.
+        
+        Args:
+            idx (int): The index of the sample.
+            sample (dict): The processed sample to cache.
+            file_path (Path): The path to the source .npy file.
+        """
+        if not self.use_cache or file_path is None:
+            return
+            
+        cache_path = self._get_cache_path(idx, file_path)
+        if cache_path:
+            try:
+                with open(cache_path, 'wb') as f:
+                    pickle.dump(sample, f)
+                logger.debug(f"Saved sample for index {idx} to cache at {cache_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save sample for index {idx} to cache: {e}")
 
     def __getitem__(self, idx):
         """
@@ -297,6 +405,24 @@ class BaseMhcDataset(Dataset):
         health_code = row['healthCode']
         time_range_str = row['time_range']
         file_uris_list = row['file_uris'] # Assumed to be a list
+
+        # Get the first valid file path to use for cache location
+        cache_reference_path = None
+        if self.use_cache and isinstance(file_uris_list, list) and file_uris_list:
+            for uri in file_uris_list:
+                try:
+                    file_path = self.root_dir / uri
+                    if file_path.exists():
+                        cache_reference_path = file_path
+                        break
+                except:
+                    continue
+            
+            # Check if the sample is already cached (skips if force_recompute is True)
+            if cache_reference_path:
+                cached_sample = self._check_cache(idx, cache_reference_path)
+                if cached_sample is not None:
+                    return cached_sample
 
         # 1. Parse time range and generate expected dates
         try:
@@ -469,6 +595,10 @@ class BaseMhcDataset(Dataset):
         # Apply mask to data: explicitly zero out data values where mask is 0
         if 'data' in result_dict and 'mask' in result_dict:
             result_dict['data'] = result_dict['data'] * result_dict['mask']
+
+        # Save the processed sample to cache
+        if self.use_cache and cache_reference_path:
+            self._save_to_cache(idx, result_dict, cache_reference_path)
 
         return result_dict
 

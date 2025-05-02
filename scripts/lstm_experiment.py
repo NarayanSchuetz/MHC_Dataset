@@ -12,6 +12,7 @@ from pathlib import Path
 # Import the MHC dataset and LSTM models
 from torch_dataset import BaseMhcDataset
 from models.lstm import AutoencoderLSTM, RevInAutoencoderLSTM, LSTMTrainer
+from dataset_postprocessors import CustomMaskPostprocessor, HeartRateInterpolationPostprocessor
 
 
 def parse_args():
@@ -217,7 +218,7 @@ def main():
             bidirectional=args.bidirectional,
             target_labels=target_labels,
             prediction_horizon=args.prediction_horizon,
-            use_masked_loss=True,
+            use_masked_loss=False,
             teacher_forcing_ratio=args.initial_tf,
             rev_in_affine=args.revin_affine,
             rev_in_subtract_last=args.revin_subtract_last
