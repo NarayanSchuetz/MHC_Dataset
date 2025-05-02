@@ -49,7 +49,7 @@ class BaseMhcDataset(Dataset):
                  dataframe: pd.DataFrame,
                  root_dir: str,
                  include_mask: bool = False,
-                 feature_indices: Optional[List[int]] = None,
+                 feature_indices: List[int] = None,
                  feature_stats: Optional[dict] = None,
                  postprocessors: Optional[List[Callable]] = None,
                  use_cache: bool = False,
@@ -61,7 +61,7 @@ class BaseMhcDataset(Dataset):
             include_mask (bool): Whether to load and include a mask channel
                                  (from index 0 of the npy file) alongside the data.
                                  Defaults to False.
-            feature_indices (Optional[List[int]]): Optional list of integer indices for the features
+            feature_indices (Optional[List[int]]): List of integer indices for the features
                                                     to select. If None, all 24 features are used.
                                                     Indices must be within [0, 23].
             feature_stats (Optional[dict]): Optional dictionary mapping *original* feature indices
@@ -81,8 +81,8 @@ class BaseMhcDataset(Dataset):
                                    will still be saved if use_cache is True. Defaults to False.
         """
         super().__init__()
-        if not isinstance(dataframe, pd.DataFrame):
-            raise TypeError("dataframe must be a pandas DataFrame.")
+        assert feature_indices is not None, "feature_indices must be provided."
+        
         required_cols = ['healthCode', 'time_range', 'file_uris']
         for col in required_cols:
             if col not in dataframe.columns:
@@ -1109,3 +1109,5 @@ class FlattenedForecastingDataset(FlattenedMhcDataset):
                           f"for index {idx}. 'mask_x' and 'mask_y' will be missing.")
 
         return result_dict
+
+

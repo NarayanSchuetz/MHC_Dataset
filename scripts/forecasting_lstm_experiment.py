@@ -8,12 +8,12 @@ import wandb
 from datetime import datetime
 from torch.utils.data import DataLoader
 from pathlib import Path
+import torch.nn.functional as F
 
-# Import the MHC dataset and LSTM models
-from torch_dataset import ForecastingEvaluationDataset
+# Import forecasting models and datasets
 from models.forecasting_lstm import ForecastingLSTM, RevInForecastingLSTM
-from models.lstm import LSTMTrainer
-from dataset_postprocessors import CustomMaskPostprocessor, HeartRateInterpolationPostprocessor
+from torch_dataset import ForecastingDataset # Using flattened for potentially easier sequence handling
+from dataset_postprocessors import CustomMaskPostprocessor, HeartRateInterpolationPostprocessor # Keep postprocessors if needed
 
 
 def parse_args():
@@ -21,10 +21,10 @@ def parse_args():
     
     # Data paths
     parser.add_argument('--dataset_path', type=str, 
-                        default="/scratch/users/schuetzn/data/mhc_dataset_out/splits/train_dataset.parquet",
+                        default="/scratch/users/schuetzn/data/mhc_dataset_out/splits/train_final_dataset.parquet",
                         help='Path to the training dataset parquet file')
     parser.add_argument('--val_dataset_path', type=str, 
-                        default="/scratch/users/schuetzn/data/mhc_dataset_out/splits/val_dataset.parquet",
+                        default="/scratch/users/schuetzn/data/mhc_dataset_out/splits/validation_dataset.parquet",
                         help='Path to the validation dataset parquet file')
     parser.add_argument('--root_dir', type=str, 
                         default="/scratch/groups/euan/mhc/mhc_dataset",
@@ -34,28 +34,25 @@ def parse_args():
                         help='Path to standardization parameters CSV')
     
     # Training parameters
-    parser.add_argument('--batch_size', type=int, default=128, help='Batch size for training')
-    parser.add_argument('--num_epochs', type=int, default=20, help='Number of epochs to train')
-    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training') # Smaller default may be needed
+    parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs to train')
+    parser.add_argument('--lr', type=float, default=0.0005, help='Learning rate')
     parser.add_argument('--num_workers', type=int, default=16, help='Number of data loading workers')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     
+    # Forecasting Dataset parameters
+    parser.add_argument('--input_seq_len_days', type=int, default=7, help='Length of the input sequence in days')
+    parser.add_argument('--output_seq_len_days', type=int, default=1, help='Length of the output sequence (forecast horizon) in days')
+    parser.add_argument('--time_points_per_day', type=int, default=1440, help='Number of time points (minutes) per day')
+
     # Model parameters
-    parser.add_argument('--hidden_size', type=int, default=256, help='Hidden size of LSTM')
-    parser.add_argument('--encoding_dim', type=int, default=256, help='Dimension of encoded segments')
-    parser.add_argument('--num_layers', type=int, default=5, help='Number of LSTM layers')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout probability')
+    parser.add_argument('--hidden_size', type=int, default=360, help='Hidden size of LSTM')
+    parser.add_argument('--encoding_dim', type=int, default=180, help='Dimension of encoded segments')
+    parser.add_argument('--num_layers', type=int, default=3, help='Number of LSTM layers')
+    parser.add_argument('--dropout', type=float, default=0.2, help='Dropout probability')
     parser.add_argument('--bidirectional', action='store_true', help='Use bidirectional LSTM')
-    parser.add_argument('--num_features', type=int, default=6, 
-                        help='Number of features per minute to use')
-    
-    # Forecasting parameters
-    parser.add_argument('--sequence_len_days', type=int, default=5, 
-                        help='Number of days in input sequence (context)')
-    parser.add_argument('--prediction_horizon_days', type=int, default=2, 
-                        help='Number of days to predict (forecast horizon)')
-    parser.add_argument('--overlap_days', type=int, default=0, 
-                        help='Overlap between input and prediction in days')
+    parser.add_argument('--num_features', type=int, default=6, # Adjusted default based on lstm_experiment.py
+                        help='Number of features per minute to use (must match dataset)')
     
     # RevIN parameters
     parser.add_argument('--use_revin', action='store_true', 
@@ -65,15 +62,19 @@ def parse_args():
     parser.add_argument('--revin_subtract_last', action='store_true', 
                         help='Subtract last element instead of mean in RevIN')
     
+    # Loss parameters
+    parser.add_argument('--use_masked_loss', action='store_true',
+                        help='Use mask to ignore missing values in loss calculation')
+
     # Experiment tracking
-    parser.add_argument('--wandb_project', type=str, default='mhc-forecasting', 
+    parser.add_argument('--wandb_project', type=str, default='mhc-forecasting-lstm', 
                         help='WandB project name')
     parser.add_argument('--wandb_entity', type=str, default=None, 
                         help='WandB entity name')
     parser.add_argument('--run_name', type=str, default=None, 
                         help='Name for this run (default: auto-generated based on timestamp)')
     parser.add_argument('--save_model', action='store_true', help='Save model checkpoints')
-    parser.add_argument('--checkpoint_dir', type=str, default='forecasting_checkpoints', 
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/forecasting', 
                         help='Directory to save model checkpoints')
     
     args = parser.parse_args()
@@ -81,56 +82,139 @@ def parse_args():
     # Auto-generate run name if not provided
     if args.run_name is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_type = "revin_" if args.use_revin else ""
-        args.run_name = f"{model_type}forecasting_lstm_{args.num_layers}layer_h{args.hidden_size}_{timestamp}"
+        model_type = "revin_forecast" if args.use_revin else "forecast_lstm"
+        args.run_name = f"{model_type}_{args.num_layers}layer_h{args.hidden_size}_in{args.input_seq_len_days}d_out{args.output_seq_len_days}d_{timestamp}"
+    
+    # Calculate sequence lengths in time points
+    args.input_sequence_len = args.input_seq_len_days * args.time_points_per_day
+    args.output_sequence_len = args.output_seq_len_days * args.time_points_per_day
     
     return args
 
-
-def log_sample_prediction(model, val_dataset, device, sample_idx=0, feature_idx=0, segment_idx=0):
-    """Log prediction visualization to wandb"""
+# Note: log_sample_prediction needs significant adaptation for forecasting
+# It should plot input context, target forecast, and predicted forecast
+# This is a simplified placeholder version
+def log_sample_prediction(model, val_dataset, device, args, sample_idx=0, feature_idx=0):
+    """Log prediction visualization to wandb (simplified for forecasting)"""
     with torch.no_grad():
-        # Get a sample from validation set
+        model.eval()
+        # Get a sample
         sample = val_dataset[sample_idx]
         
-        # Prepare batch format
+        # Prepare batch format for model's forward pass
         batch = {
-            'data_x': sample['data_x'].unsqueeze(0).to(device),  # Add batch dimension
-            'data_y': sample['data_y'].unsqueeze(0).to(device),  # Add batch dimension
-            'mask_x': sample['mask_x'].unsqueeze(0).to(device) if 'mask_x' in sample else None,
-            'mask_y': sample['mask_y'].unsqueeze(0).to(device) if 'mask_y' in sample else None
+            'data_x': sample['data_x'].unsqueeze(0).to(device),
+            'data_y': sample['data_y'].unsqueeze(0).to(device),
         }
-        
+        if args.use_masked_loss and 'mask_x' in sample:
+             batch['mask_x'] = sample['mask_x'].unsqueeze(0).to(device)
+             batch['mask_y'] = sample['mask_y'].unsqueeze(0).to(device)
+
         # Forward pass
-        model.eval()
-        output = model(batch)
+        output = model(batch, return_predictions=False) # No label predictions here
         
-        # Get predictions
-        predicted_segments = output['sequence_output'][0].cpu().numpy()  # Remove batch dimension
-        target_segments = output['target_segments'][0].cpu().numpy()
+        # Get predictions and targets (already in segment format)
+        # Shape: (1, num_target_segments, features_per_segment)
+        predicted_segments = output['sequence_output'][0].cpu() 
+        target_segments = output['target_segments'][0].cpu()
+
+        # Reshape segments back to time series for plotting
+        # (num_target_segments, features * minutes_per_segment) -> (num_target_segments * minutes_per_segment, features)
+        minutes_per_segment = model.minutes_per_segment
+        num_target_segments = target_segments.shape[0]
         
-        # Extract the first 30 values for visualization
-        predicted_values = predicted_segments[segment_idx, :30]
-        target_values = target_segments[segment_idx, :30]
+        pred_ts = predicted_segments.view(num_target_segments, args.num_features, minutes_per_segment)
+        pred_ts = pred_ts.permute(0, 2, 1).reshape(-1, args.num_features).numpy()
         
-        plt.figure(figsize=(10, 4))
-        plt.plot(predicted_values, label='Predicted', marker='o')
-        plt.plot(target_values, label='Target', marker='x')
-        plt.xlabel('Time index')
+        target_ts = target_segments.view(num_target_segments, args.num_features, minutes_per_segment)
+        target_ts = target_ts.permute(0, 2, 1).reshape(-1, args.num_features).numpy()
+
+        # Plot a specific feature
+        plt.figure(figsize=(12, 5))
+        time_axis = np.arange(len(pred_ts))
+        plt.plot(time_axis, pred_ts[:, feature_idx], label=f'Predicted Feature {feature_idx}', marker='.', linestyle='-')
+        plt.plot(time_axis, target_ts[:, feature_idx], label=f'Target Feature {feature_idx}', marker='x', linestyle='--')
+        
+        plt.xlabel('Time index within forecast horizon')
         plt.ylabel('Value')
-        plt.title(f'Prediction vs Target for Feature {feature_idx}, Segment {segment_idx}')
+        plt.title(f'Forecast vs Target for Feature {feature_idx} (Sample {sample_idx})')
         plt.legend()
         plt.grid(True)
         
         # Log to wandb
-        wandb.log({"sample_prediction": wandb.Image(plt)})
+        wandb.log({"sample_forecast_comparison": wandb.Image(plt)})
         plt.close()
+
+
+def train_epoch(model, dataloader, optimizer, device, use_masked_loss):
+    """Trains the model for one epoch."""
+    model.train()
+    total_loss = 0
+    for batch in dataloader:
+        optimizer.zero_grad()
+        
+        # Move data to device
+        batch_data_x = batch['data_x'].to(device)
+        batch_data_y = batch['data_y'].to(device)
+        
+        model_batch = {
+            'data_x': batch_data_x,
+            'data_y': batch_data_y
+        }
+        
+        # Add masks if needed
+        if use_masked_loss:
+            if 'mask_x' in batch: model_batch['mask_x'] = batch['mask_x'].to(device)
+            if 'mask_y' in batch: model_batch['mask_y'] = batch['mask_y'].to(device)
+
+        # Forward pass
+        output = model(model_batch, return_predictions=False) # Assuming no aux labels for now
+        
+        # Compute loss
+        loss = model.compute_loss(output, model_batch)
+        
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        
+    return total_loss / len(dataloader)
+
+def validate(model, dataloader, device, use_masked_loss):
+    """Evaluates the model on the validation set."""
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            # Move data to device
+            batch_data_x = batch['data_x'].to(device)
+            batch_data_y = batch['data_y'].to(device)
+            
+            model_batch = {
+                'data_x': batch_data_x,
+                'data_y': batch_data_y
+            }
+            
+            # Add masks if needed
+            if use_masked_loss:
+                 if 'mask_x' in batch: model_batch['mask_x'] = batch['mask_x'].to(device)
+                 if 'mask_y' in batch: model_batch['mask_y'] = batch['mask_y'].to(device)
+
+            # Forward pass
+            output = model(model_batch, return_predictions=False)
+            
+            # Compute loss
+            loss = model.compute_loss(output, model_batch)
+            total_loss += loss.item()
+            
+    return total_loss / len(dataloader)
 
 
 def main():
     args = parse_args()
     
-    # Set random seed for reproducibility
+    # Set random seed
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
@@ -146,112 +230,108 @@ def main():
     print(f"Loading validation dataset from {args.val_dataset_path}")
     print(f"Using root directory: {args.root_dir}")
     
-    # Convert days to time points
-    minutes_per_day = 24 * 60  # 1440 minutes per day
-    sequence_len = args.sequence_len_days * minutes_per_day
-    prediction_horizon = args.prediction_horizon_days * minutes_per_day
-    overlap = args.overlap_days * minutes_per_day
-    
     # Load standardization parameters
     standardization_df = pd.read_csv(args.standardization_path)
     scaler_stats = {}
-    for f_idx, row in standardization_df.iloc[:args.num_features].iterrows():
-        scaler_stats[f_idx] = (row["mean"], row["std_dev"])
-    
+    # Ensure we use the correct number of features specified
+    selected_features = list(range(args.num_features))
+    for f_idx in selected_features:
+         row = standardization_df.iloc[f_idx]
+         scaler_stats[f_idx] = (row["mean"], row["std_dev"])
+    print(f"Using {args.num_features} features with indices: {selected_features}")
+
     # Load the training dataset from parquet
     train_df = pd.read_parquet(args.dataset_path)
     train_df["file_uris"] = train_df["file_uris"].apply(eval)
-    print(f"Loaded training dataset with {len(train_df)} samples")
+    print(f"Loaded training dataset manifest with {len(train_df)} samples")
     
     # Load the validation dataset from parquet
     val_df = pd.read_parquet(args.val_dataset_path)
     val_df["file_uris"] = val_df["file_uris"].apply(eval)
-    print(f"Loaded validation dataset with {len(val_df)} samples")
+    print(f"Loaded validation dataset manifest with {len(val_df)} samples")
     
-    # Print available label columns
-    label_cols = [col for col in train_df.columns if col.endswith('_value')]
-    print(f"Available label columns: {label_cols}")
-    
-    # Define postprocessors
-    p0 = CustomMaskPostprocessor(heart_rate_original_index=5, expected_raw_features=6, consecutive_zero_threshold=30)
-    p1 = HeartRateInterpolationPostprocessor(heart_rate_original_index=5, expected_raw_features=6, hr_gap_threshold=30)
+    # Define postprocessors if needed (example uses HR interpolation)
+    # Adjust indices based on the actual selected features if necessary
+    original_hr_index = 5 
 
-    # Create the forecasting datasets with mask
-    train_dataset = ForecastingEvaluationDataset(
+    p0 = CustomMaskPostprocessor(heart_rate_original_index=original_hr_index, expected_raw_features=args.num_features, consecutive_zero_threshold=30)
+    p1 = HeartRateInterpolationPostprocessor(heart_rate_original_index=original_hr_index, expected_raw_features=args.num_features, hr_gap_threshold=30)
+    postprocessors = [p0, p1]
+
+
+
+    # Create the FlattenedForecastingDataset datasets
+    train_dataset = ForecastingDataset(
         dataframe=train_df,
         root_dir=args.root_dir,
-        sequence_len=sequence_len,
-        prediction_horizon=prediction_horizon,
-        overlap=overlap,
-        include_mask=True,
-        feature_indices=list(range(args.num_features)),
+        input_sequence_len=args.input_sequence_len,
+        output_sequence_len=args.output_sequence_len,
+        include_mask=args.use_masked_loss, # Include mask only if needed for loss
+        feature_indices=selected_features,
         feature_stats=scaler_stats,
-        postprocessors=[p0, p1]
+        postprocessors=postprocessors
     )
     
-    val_dataset = ForecastingEvaluationDataset(
+    val_dataset = ForecastingDataset(
         dataframe=val_df,
         root_dir=args.root_dir,
-        sequence_len=sequence_len,
-        prediction_horizon=prediction_horizon,
-        overlap=overlap,
-        include_mask=True,
-        feature_indices=list(range(args.num_features)),
+        input_sequence_len=args.input_sequence_len,
+        output_sequence_len=args.output_sequence_len,
+        include_mask=args.use_masked_loss, # Include mask only if needed for loss
+        feature_indices=selected_features,
         feature_stats=scaler_stats,
-        postprocessors=[p0, p1]
+        postprocessors=postprocessors
     )
     
-    print(f"Created forecasting datasets with {len(train_dataset)} training and {len(val_dataset)} validation samples")
-    print(f"Input sequence (context): {args.sequence_len_days} days ({sequence_len} minutes)")
-    print(f"Prediction horizon: {args.prediction_horizon_days} days ({prediction_horizon} minutes)")
-    print(f"Overlap: {args.overlap_days} days ({overlap} minutes)")
+    print(f"Created datasets with {len(train_dataset)} training and {len(val_dataset)} validation samples")
+    print(f"Input sequence length: {args.input_sequence_len} time points ({args.input_seq_len_days} days)")
+    print(f"Output sequence length: {args.output_sequence_len} time points ({args.output_seq_len_days} days)")
     
     # Create data loaders
     train_loader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
         shuffle=True, 
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        pin_memory=True # Recommended for GPU training
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=args.batch_size, 
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        pin_memory=True
     )
     
     # Initialize model
-    # Set target_labels to [] if there are no labels to predict
-    target_labels = []  # Can be modified to include labels if needed
+    target_labels = [] # ForecastingLSTM doesn't predict separate labels by default
     
     # Choose model type based on use_revin flag
     if args.use_revin:
-        print("Initializing RevInForecastingLSTM model")
+        print("Using RevInForecastingLSTM model")
         model = RevInForecastingLSTM(
-            num_features=args.num_features,
+            num_features=args.num_features, # This should be the number of features used in the dataset
             hidden_size=args.hidden_size,
             encoding_dim=args.encoding_dim,
             num_layers=args.num_layers,
             dropout=args.dropout,
             bidirectional=args.bidirectional,
-            target_labels=target_labels,
-            use_masked_loss=True,  # Using masked loss for better handling of missing values
+            target_labels=target_labels, # No separate labels
+            use_masked_loss=args.use_masked_loss,
             rev_in_affine=args.revin_affine,
             rev_in_subtract_last=args.revin_subtract_last
         )
     else:
-        print("Initializing standard ForecastingLSTM model")
+        print("Using standard ForecastingLSTM model")
         model = ForecastingLSTM(
-            num_features=args.num_features,
+            num_features=args.num_features, # Match dataset features
             hidden_size=args.hidden_size,
             encoding_dim=args.encoding_dim,
             num_layers=args.num_layers,
             dropout=args.dropout,
             bidirectional=args.bidirectional,
-            target_labels=target_labels,
-            use_masked_loss=True  # Using masked loss for better handling of missing values
+            target_labels=target_labels, # No separate labels
+            use_masked_loss=args.use_masked_loss
         )
-    
-    print(f"Initialized model with target labels: {target_labels}")
     
     # Calculate model parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -269,25 +349,28 @@ def main():
     # Set up optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     
-    # Set up trainer
+    # Set up device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    trainer = LSTMTrainer(model, optimizer, device)
+    model.to(device)
     
     # Create checkpoint directory if needed
     if args.save_model:
-        checkpoint_dir = Path(args.checkpoint_dir)
+        checkpoint_dir = Path(args.checkpoint_dir) / args.run_name # Save checkpoints in run-specific folder
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Checkpoints will be saved to: {checkpoint_dir}")
     
     # Train the model
     best_val_loss = float('inf')
     
+    print(f"Training for {args.num_epochs} epochs...")
+    
     for epoch in range(args.num_epochs):
         # Train for one epoch
-        train_loss = trainer.train_epoch(train_loader)
+        train_loss = train_epoch(model, train_loader, optimizer, device, args.use_masked_loss)
         
         # Validate
-        val_loss = trainer.validate(val_loader)
+        val_loss = validate(model, val_loader, device, args.use_masked_loss)
         
         # Log to wandb
         wandb.log({
@@ -297,69 +380,48 @@ def main():
             "learning_rate": optimizer.param_groups[0]['lr'],
         })
         
-        print(f"Epoch {epoch+1}/{args.num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        print(f"Epoch {epoch+1}/{args.num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         
         # Save checkpoint if validation loss improved
         if args.save_model and val_loss < best_val_loss:
             best_val_loss = val_loss
-            checkpoint_path = checkpoint_dir / f"{args.run_name}_best.pt"
+            checkpoint_path = checkpoint_dir / f"best_model.pt"
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'train_loss': train_loss,
                 'val_loss': val_loss,
+                'args': args # Save args for reloading
             }, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path}")
-            wandb.save(str(checkpoint_path))
+            print(f"Saved best model checkpoint to {checkpoint_path}")
+            # wandb.save(str(checkpoint_path)) # Saving files to wandb might be slow/large
         
-        # Visualize predictions and log to wandb (every 5 epochs)
+        # Visualize predictions and log to wandb (e.g., every 5 epochs)
         if (epoch + 1) % 5 == 0 or epoch == args.num_epochs - 1:
-            log_sample_prediction(model, val_dataset, device)
-    
+             if len(val_dataset) > 0:
+                 log_sample_prediction(model, val_dataset, device, args, sample_idx=0, feature_idx=0) # Log first feature
+             else:
+                 print("Validation dataset is empty, skipping prediction visualization.")
+
     # Save final model checkpoint
     if args.save_model:
-        final_checkpoint_path = checkpoint_dir / f"{args.run_name}_final.pt"
+        final_checkpoint_path = checkpoint_dir / f"final_model_epoch{args.num_epochs}.pt"
         torch.save({
             'epoch': args.num_epochs,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'train_loss': train_loss,
-            'val_loss': val_loss,
+            'train_loss': train_loss, # Last epoch train loss
+            'val_loss': val_loss,     # Last epoch val loss
+            'args': args
         }, final_checkpoint_path)
-        print(f"Saved final checkpoint to {final_checkpoint_path}")
-        wandb.save(str(final_checkpoint_path))
-    
-    # Evaluate model on test set using the model's built-in evaluation
-    print("Evaluating model on validation set...")
-    eval_metrics = model.evaluate_forecast(
-        dataframe=val_df,
-        root_dir=args.root_dir,
-        sequence_len=sequence_len,
-        prediction_horizon=prediction_horizon,
-        overlap=overlap,
-        batch_size=args.batch_size,
-        include_mask=True,
-        feature_indices=list(range(args.num_features)),
-        feature_stats=scaler_stats,
-        device=device
-    )
-    
-    print(f"Validation Metrics: MSE: {eval_metrics['mse']:.4f}, MAE: {eval_metrics['mae']:.4f}, RMSE: {eval_metrics['rmse']:.4f}")
-    
-    # Log final metrics to wandb
-    wandb.log({
-        "final_val_mse": eval_metrics['mse'],
-        "final_val_mae": eval_metrics['mae'],
-        "final_val_rmse": eval_metrics['rmse']
-    })
+        print(f"Saved final model checkpoint to {final_checkpoint_path}")
+        # wandb.save(str(final_checkpoint_path)) 
     
     # Finish wandb run
     wandb.finish()
     
     print("Training completed!")
-    return model, trainer
-
 
 if __name__ == "__main__":
     main() 
