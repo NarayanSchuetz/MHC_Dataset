@@ -329,9 +329,36 @@ def evaluate_forecast(
         feature_stats=feature_stats
     )
     
+    # Use the dataset-based evaluation
+    return evaluate_forecast_dataset(
+        model=model,
+        dataset=forecast_dataset,
+        batch_size=batch_size,
+        device=device
+    )
+
+
+def evaluate_forecast_dataset(
+    model: Union[AutoencoderLSTM, RevInAutoencoderLSTM],
+    dataset,  # ForecastingEvaluationDataset or compatible
+    batch_size: int = 16,
+    device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+) -> Dict:
+    """
+    Evaluate forecasting performance of a model using a pre-created dataset.
+    
+    Args:
+        model: The LSTM model (AutoencoderLSTM or RevInAutoencoderLSTM)
+        dataset: Pre-configured dataset with forecasting data
+        batch_size: Batch size for evaluation
+        device: Device to run evaluation on
+    
+    Returns:
+        Dictionary with MAE, MSE, Pearson Correlation metrics per channel and overall.
+    """
     # Create data loader
     dataloader = DataLoader(
-        forecast_dataset,
+        dataset,
         batch_size=batch_size,
         shuffle=False  # Don't shuffle for evaluation
     )
@@ -340,24 +367,35 @@ def evaluate_forecast(
     model.to(device)
     model.eval()
     
-    # Determine number of features
-    if feature_indices is not None:
-        num_features = len(feature_indices)
-    elif len(forecast_dataset) > 0:
-        sample = forecast_dataset[0]
-        # Assuming data_x shape is [D, F, T_x] or similar
-        # Check both data_x and data_y for shape info
-        if 'data_x' in sample and len(sample['data_x'].shape) > 1:
-             num_features = sample['data_x'].shape[1] 
-        elif 'data_y' in sample and len(sample['data_y'].shape) > 2:
-             num_features = sample['data_y'].shape[2] # [B, D_out, F, T_pred]
+    # Determine number of features and prediction horizon
+    if len(dataset) > 0:
+        sample = dataset[0]
+        # Extract prediction_horizon from the dataset's sample
+        if 'data_y' in sample and len(sample['data_y'].shape) >= 3:
+            # For forecasting datasets, prediction_horizon should be available
+            if hasattr(dataset, 'prediction_horizon'):
+                prediction_horizon = dataset.prediction_horizon
+            else:
+                # Infer from shape if not directly available
+                _, _, time_dim = sample['data_y'].shape
+                prediction_horizon = time_dim  # Assumption based on dataset structure
+                
+            # Get number of features
+            if len(sample['data_y'].shape) == 3:  # [D_out, F, T_pred]
+                num_features = sample['data_y'].shape[1]
+            elif len(sample['data_y'].shape) == 4:  # [B, D_out, F, T_pred]
+                num_features = sample['data_y'].shape[2]
+            else:
+                num_features = 24  # Fallback
+                print("Warning: Unexpected data_y shape. Defaulting to 24 features.")
         else:
-             num_features = 24 # Fallback
-             print("Warning: Could not determine num_features from dataset sample, defaulting to 24.")
+            num_features = 24  # Fallback if structure doesn't match expectations
+            prediction_horizon = 2880  # 2 days default (assuming minutes)
+            print("Warning: Could not determine dimensions from dataset. Using defaults.")
     else:
-        num_features = 24 # Fallback
-        print("Warning: Dataset is empty, defaulting num_features to 24.")
-
+        num_features = 24  # Fallback
+        prediction_horizon = 2880  # 2 days default
+        print("Warning: Dataset is empty, using default dimensions.")
 
     # Initialize running metrics (use float64 for sums)
     running_mae_sum = torch.tensor(0.0, dtype=torch.float64, device=device)
@@ -473,46 +511,63 @@ def evaluate_forecast(
 
 def run_forecast_evaluation(
     model: Union[AutoencoderLSTM, RevInAutoencoderLSTM],
-    dataframe: pd.DataFrame,
-    root_dir: str,
+    dataframe: pd.DataFrame = None,
+    root_dir: str = None,
     split: str = "5-2d",
     batch_size: int = 16,
     include_mask: bool = True,
     feature_indices: Optional[List[int]] = None,
     feature_names: Optional[List[str]] = None,
     feature_stats: Optional[Dict] = None,
-    device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+    dataset = None  # Optional pre-configured dataset
 ) -> Dict: # Return results dict
     """
     Run forecast evaluation and print formatted results.
     
     Args:
         model: The LSTM model to evaluate
-        dataframe: DataFrame with MHC dataset metadata
-        root_dir: Root directory for data files
-        split: String defining the forecast split (e.g., "5-2d")
+        dataframe: DataFrame with MHC dataset metadata (not needed if dataset is provided)
+        root_dir: Root directory for data files (not needed if dataset is provided)
+        split: String defining the forecast split (e.g., "5-2d") (not needed if dataset is provided)
         batch_size: Batch size for evaluation
-        include_mask: Whether to include masks
-        feature_indices: Optional list of feature indices to select
+        include_mask: Whether to include masks (not needed if dataset is provided)
+        feature_indices: Optional list of feature indices to select (not needed if dataset is provided)
         feature_names: Optional list of feature names for reporting
-        feature_stats: Optional dictionary for feature standardization
+        feature_stats: Optional dictionary for feature standardization (not needed if dataset is provided)
         device: Device to run evaluation on
+        dataset: Optional pre-configured ForecastingEvaluationDataset or compatible dataset
+                (if provided, dataframe, root_dir, split, include_mask, feature_indices, and
+                feature_stats parameters are ignored)
         
     Returns:
         Dictionary containing the evaluation results.
     """
     # Run evaluation
-    results = evaluate_forecast(
-        model=model,
-        dataframe=dataframe,
-        root_dir=root_dir,
-        split=split,
-        batch_size=batch_size,
-        include_mask=include_mask,
-        feature_indices=feature_indices,
-        feature_stats=feature_stats,
-        device=device
-    )
+    if dataset is not None:
+        # Use provided dataset
+        results = evaluate_forecast_dataset(
+            model=model,
+            dataset=dataset,
+            batch_size=batch_size,
+            device=device
+        )
+    else:
+        # Create and use dataset from parameters
+        if dataframe is None or root_dir is None:
+            raise ValueError("If dataset is not provided, dataframe and root_dir must be specified")
+            
+        results = evaluate_forecast(
+            model=model,
+            dataframe=dataframe,
+            root_dir=root_dir,
+            split=split,
+            batch_size=batch_size,
+            include_mask=include_mask,
+            feature_indices=feature_indices,
+            feature_stats=feature_stats,
+            device=device
+        )
     
     # --- Print Overall Results ---
     print("\n--- Overall Metrics ---")
@@ -562,6 +617,7 @@ def run_forecast_evaluation(
 if __name__ == "__main__":
     import argparse
     from models.lstm import load_checkpoint, RevInAutoencoderLSTM
+    from torch_dataset import ForecastingEvaluationDataset
     
     parser = argparse.ArgumentParser(description='Evaluate LSTM model forecasting')
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
@@ -570,6 +626,7 @@ if __name__ == "__main__":
     parser.add_argument('--split', type=str, default='5-2d', help='Forecast split (e.g., "5-2d")')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for evaluation')
     parser.add_argument('--no_mask', action='store_true', help='Disable using mask during evaluation')
+    parser.add_argument('--use_dataset_api', action='store_true', help='Use the dataset-based API instead of dataframe')
     args = parser.parse_args()
     
     # Load the CSV file
@@ -606,13 +663,39 @@ if __name__ == "__main__":
     feature_names = [f"Feature_{i}" for i in range(num_features_loaded)]
     
     # Run evaluation
-    evaluation_results = run_forecast_evaluation(
-        model=model,
-        dataframe=test_df,
-        root_dir=args.data_root,
-        split=args.split,
-        batch_size=args.batch_size,
-        include_mask=(not args.no_mask),
-        feature_names=feature_names,
-        device=device
-    )
+    if args.use_dataset_api:
+        # Parse the split string for dataset creation
+        sequence_len, prediction_horizon, overlap = parse_forecast_split(args.split)
+        
+        # Create the dataset directly
+        print(f"Creating evaluation dataset with split {args.split}...")
+        dataset = ForecastingEvaluationDataset(
+            dataframe=test_df,
+            root_dir=args.data_root,
+            sequence_len=sequence_len,
+            prediction_horizon=prediction_horizon,
+            overlap=overlap,
+            include_mask=(not args.no_mask)
+        )
+        
+        print(f"Using dataset-based API with {len(dataset)} samples")
+        evaluation_results = run_forecast_evaluation(
+            model=model,
+            batch_size=args.batch_size,
+            feature_names=feature_names,
+            device=device,
+            dataset=dataset  # Pass the pre-configured dataset
+        )
+    else:
+        # Use the original API
+        print("Using dataframe-based API")
+        evaluation_results = run_forecast_evaluation(
+            model=model,
+            dataframe=test_df,
+            root_dir=args.data_root,
+            split=args.split,
+            batch_size=args.batch_size,
+            include_mask=(not args.no_mask),
+            feature_names=feature_names,
+            device=device
+        )
