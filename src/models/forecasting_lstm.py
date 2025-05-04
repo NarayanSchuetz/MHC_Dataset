@@ -33,6 +33,7 @@ class ForecastingLSTM(nn.Module):
         target_labels: Optional[List[str]] = None,
         use_masked_loss: bool = False,
         num_features: int = 24,  # Number of features per minute (default is all 24)
+        l2_weight: float = 0.0,  # Weight for L2 regularization (0.0 means disabled)
     ):
         """
         Initialize the Forecasting LSTM model.
@@ -46,6 +47,7 @@ class ForecastingLSTM(nn.Module):
             target_labels: List of target labels to predict (without '_value' suffix)
             use_masked_loss: Whether to use the binary mask to exclude missing values from loss calculation
             num_features: Number of original features per minute (e.g., 24)
+            l2_weight: Weight for L2 regularization (0.0 means disabled)
         """
         super().__init__()
         
@@ -57,6 +59,7 @@ class ForecastingLSTM(nn.Module):
         self.target_labels = target_labels if target_labels else []
         self.use_masked_loss = use_masked_loss
         self.num_original_features = num_features
+        self.l2_weight = l2_weight  # L2 regularization weight
         
         # Constants for data structure
         self.minutes_per_segment = 30
@@ -352,6 +355,13 @@ class ForecastingLSTM(nn.Module):
             if self.target_labels:  # Only add if we have target labels
                 total_loss += label_loss
         
+        # Add L2 regularization if weight > 0
+        if self.l2_weight > 0:
+            l2_reg = 0.0
+            for param in self.parameters():
+                l2_reg += torch.norm(param, 2)
+            total_loss += self.l2_weight * l2_reg
+        
         return total_loss
     
     def predict(self, input_sequence: torch.Tensor, steps: int = 1) -> torch.Tensor:
@@ -551,7 +561,8 @@ class RevInForecastingLSTM(ForecastingLSTM):
         num_features: int = 24,  # Number of features per minute (default is all 24)
         rev_in_affine: bool = False,
         rev_in_subtract_last: bool = False,
-        rev_in_eps: float = 1e-5
+        rev_in_eps: float = 1e-5,
+        l2_weight: float = 0.0,  # Weight for L2 regularization
     ):
         """
         Initialize the RevIN Forecasting LSTM model.
@@ -568,7 +579,9 @@ class RevInForecastingLSTM(ForecastingLSTM):
             rev_in_affine: If True, RevIN layer has learnable affine parameters
             rev_in_subtract_last: If True, RevIN subtracts last element instead of mean
             rev_in_eps: Small epsilon for numerical stability in RevIN calculations
+            l2_weight: Weight for L2 regularization (0.0 means disabled)
         """
+        # Initialize the parent ForecastingLSTM class
         super().__init__(
             hidden_size=hidden_size,
             encoding_dim=encoding_dim,
@@ -577,7 +590,8 @@ class RevInForecastingLSTM(ForecastingLSTM):
             bidirectional=bidirectional,
             target_labels=target_labels,
             use_masked_loss=use_masked_loss,
-            num_features=num_features
+            num_features=num_features,
+            l2_weight=l2_weight,  # Pass L2 weight to parent class
         )
         
         # RevIN configuration

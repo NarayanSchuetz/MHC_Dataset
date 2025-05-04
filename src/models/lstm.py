@@ -35,6 +35,7 @@ class AutoencoderLSTM(nn.Module):
         teacher_forcing_ratio: float = 0.5,  # Ratio of steps to use teacher forcing
         num_features: int = 24,  # Number of features per minute (default is all 24)
         force_teacher_forcing: bool = False,  # Whether to force using teacher forcing regardless of training mode
+        l2_weight: float = 0.0,  # Weight for L2 regularization (0.0 means disabled)
     ):
         """
         Initialize the Autoencoder LSTM model.
@@ -51,6 +52,7 @@ class AutoencoderLSTM(nn.Module):
             teacher_forcing_ratio: Probability of using teacher forcing during training (0.0 to 1.0)
             num_features: Number of original features per minute (e.g., 24)
             force_teacher_forcing: Whether to force using teacher forcing regardless of training mode
+            l2_weight: Weight for L2 regularization (0.0 means disabled)
         """
         super().__init__()
         
@@ -65,6 +67,7 @@ class AutoencoderLSTM(nn.Module):
         self.teacher_forcing_ratio = teacher_forcing_ratio
         self.num_original_features = num_features # Store the original number of features (e.g., 24)
         self.force_teacher_forcing = force_teacher_forcing
+        self.l2_weight = l2_weight  # L2 regularization weight
         
         # Constants for data structure
         self.minutes_per_segment = 30
@@ -346,6 +349,13 @@ class AutoencoderLSTM(nn.Module):
                         )
                         total_loss += label_loss
                     
+        # Add L2 regularization if weight > 0
+        if self.l2_weight > 0:
+            l2_reg = 0.0
+            for param in self.parameters():
+                l2_reg += torch.norm(param, 2)
+            total_loss += self.l2_weight * l2_reg
+                    
         return total_loss
     
     def predict_future(self, input_sequence: torch.Tensor, steps: int = 1) -> torch.Tensor:
@@ -617,7 +627,8 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
         force_teacher_forcing: bool = False, # Whether to force using teacher forcing regardless of training mode
         rev_in_affine: bool = False,
         rev_in_subtract_last: bool = False,
-        rev_in_eps: float = 1e-5
+        rev_in_eps: float = 1e-5,
+        l2_weight: float = 0.0, # Weight for L2 regularization
     ):
         """
         Initialize the RevIN Time Series Autoencoder LSTM model.
@@ -627,6 +638,8 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
             force_teacher_forcing: Whether to force using teacher forcing regardless of training mode
             rev_in_affine: If True, RevIN layer has learnable affine parameters
             rev_in_subtract_last: If True, RevIN subtracts last element instead of mean
+            rev_in_eps: Small epsilon for numerical stability in RevIN calculations
+            l2_weight: Weight for L2 regularization (0.0 means disabled)
             Other args are passed to AutoencoderLSTM.__init__
         """
         super().__init__(
@@ -640,7 +653,8 @@ class RevInAutoencoderLSTM(AutoencoderLSTM):
             use_masked_loss=use_masked_loss,
             teacher_forcing_ratio=teacher_forcing_ratio,
             num_features=num_features, # Passes num_original_features to parent
-            force_teacher_forcing=force_teacher_forcing
+            force_teacher_forcing=force_teacher_forcing,
+            l2_weight=l2_weight,  # Pass L2 weight to parent class
         )
 
         # Instantiate RevIN layer - operates on the original features dimension

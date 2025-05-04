@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 # Import forecasting models and datasets
 from models.forecasting_lstm import ForecastingLSTM, RevInForecastingLSTM
-from torch_dataset import ForecastingDataset # Using flattened for potentially easier sequence handling
+from torch_dataset import ForecastingEvaluationDataset # Using flattened for potentially easier sequence handling
 from dataset_postprocessors import CustomMaskPostprocessor, HeartRateInterpolationPostprocessor # Keep postprocessors if needed
 
 
@@ -27,7 +27,7 @@ def parse_args():
                         default="/scratch/users/schuetzn/data/mhc_dataset_out/splits/validation_dataset.parquet",
                         help='Path to the validation dataset parquet file')
     parser.add_argument('--root_dir', type=str, 
-                        default="/scratch/groups/euan/mhc/mhc_dataset",
+                        default="/scratch/users/schuetzn/data/mhc_dataset",
                         help='Root directory containing the MHC dataset')
     parser.add_argument('--standardization_path', type=str, 
                         default="/scratch/users/schuetzn/data/mhc_dataset_out/standardization_params.csv",
@@ -39,6 +39,14 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=0.0005, help='Learning rate')
     parser.add_argument('--num_workers', type=int, default=16, help='Number of data loading workers')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    
+    # Learning rate scheduler parameters
+    parser.add_argument('--use_lr_scheduler', action='store_true', 
+                        help='Use cosine annealing LR scheduler with warmup')
+    parser.add_argument('--warmup_epochs', type=int, default=5, 
+                        help='Number of epochs for linear warmup')
+    parser.add_argument('--lr_cycles', type=int, default=1, 
+                        help='Number of cosine annealing cycles over the total epochs')
     
     # Forecasting Dataset parameters
     parser.add_argument('--input_seq_len_days', type=int, default=7, help='Length of the input sequence in days')
@@ -53,6 +61,8 @@ def parse_args():
     parser.add_argument('--bidirectional', action='store_true', help='Use bidirectional LSTM')
     parser.add_argument('--num_features', type=int, default=6, # Adjusted default based on lstm_experiment.py
                         help='Number of features per minute to use (must match dataset)')
+    parser.add_argument('--l2_weight', type=float, default=0.0,
+                        help='Weight for L2 regularization (0.0 means disabled)')
     
     # RevIN parameters
     parser.add_argument('--use_revin', action='store_true', 
@@ -261,22 +271,22 @@ def main():
 
 
     # Create the FlattenedForecastingDataset datasets
-    train_dataset = ForecastingDataset(
+    train_dataset = ForecastingEvaluationDataset(
         dataframe=train_df,
         root_dir=args.root_dir,
-        input_sequence_len=args.input_sequence_len,
-        output_sequence_len=args.output_sequence_len,
+        sequence_len=args.input_sequence_len,
+        prediction_horizon=args.output_sequence_len,
         include_mask=args.use_masked_loss, # Include mask only if needed for loss
         feature_indices=selected_features,
         feature_stats=scaler_stats,
-        postprocessors=postprocessors
+        postprocessors=postprocessors,
     )
     
-    val_dataset = ForecastingDataset(
+    val_dataset = ForecastingEvaluationDataset(
         dataframe=val_df,
         root_dir=args.root_dir,
-        input_sequence_len=args.input_sequence_len,
-        output_sequence_len=args.output_sequence_len,
+        sequence_len=args.input_sequence_len,
+        prediction_horizon=args.output_sequence_len,
         include_mask=args.use_masked_loss, # Include mask only if needed for loss
         feature_indices=selected_features,
         feature_stats=scaler_stats,
@@ -318,7 +328,8 @@ def main():
             target_labels=target_labels, # No separate labels
             use_masked_loss=args.use_masked_loss,
             rev_in_affine=args.revin_affine,
-            rev_in_subtract_last=args.revin_subtract_last
+            rev_in_subtract_last=args.revin_subtract_last,
+            l2_weight=args.l2_weight  # Added L2 regularization weight
         )
     else:
         print("Using standard ForecastingLSTM model")
@@ -330,7 +341,8 @@ def main():
             dropout=args.dropout,
             bidirectional=args.bidirectional,
             target_labels=target_labels, # No separate labels
-            use_masked_loss=args.use_masked_loss
+            use_masked_loss=args.use_masked_loss,
+            l2_weight=args.l2_weight  # Added L2 regularization weight
         )
     
     # Calculate model parameters
@@ -348,6 +360,37 @@ def main():
     
     # Set up optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    
+    # Set up learning rate scheduler if requested
+    scheduler = None
+    if args.use_lr_scheduler:
+        print(f"Using cosine annealing LR scheduler with {args.warmup_epochs} warmup epochs")
+        
+        # Calculate the total steps for warmup and cosine annealing
+        num_train_steps = len(train_loader) * args.num_epochs
+        warmup_steps = len(train_loader) * args.warmup_epochs
+        
+        # Calculate the cycle length in steps
+        cycle_steps = (num_train_steps - warmup_steps) // args.lr_cycles
+        
+        # Create a custom learning rate scheduler with linear warmup and cosine annealing
+        def lr_lambda(current_step):
+            # Linear warmup phase
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            
+            # Cosine annealing phase
+            progress = float(current_step - warmup_steps) / float(max(1, cycle_steps))
+            cycle_idx = (current_step - warmup_steps) // cycle_steps
+            
+            # Adjust progress for current cycle
+            progress = progress - cycle_idx
+            
+            # Cosine decay from 1.0 to 0.0 (or some minimum value like 0.1)
+            min_lr_factor = 0.1  # Minimum LR will be 10% of max LR
+            return min_lr_factor + 0.5 * (1.0 - min_lr_factor) * (1.0 + np.cos(np.pi * progress))
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     # Set up device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -369,18 +412,27 @@ def main():
         # Train for one epoch
         train_loss = train_epoch(model, train_loader, optimizer, device, args.use_masked_loss)
         
+        # Step scheduler after each epoch if it exists
+        current_lr = optimizer.param_groups[0]['lr']
+        
         # Validate
         val_loss = validate(model, val_loader, device, args.use_masked_loss)
+        
+        # Step scheduler if it exists
+        if scheduler is not None:
+            # For epoch-based schedulers
+            if not isinstance(scheduler, torch.optim.lr_scheduler.LambdaLR):
+                scheduler.step()
         
         # Log to wandb
         wandb.log({
             "epoch": epoch + 1,
             "train_loss": train_loss,
             "val_loss": val_loss,
-            "learning_rate": optimizer.param_groups[0]['lr'],
+            "learning_rate": current_lr,
         })
         
-        print(f"Epoch {epoch+1}/{args.num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+        print(f"Epoch {epoch+1}/{args.num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, LR: {current_lr:.6f}")
         
         # Save checkpoint if validation loss improved
         if args.save_model and val_loss < best_val_loss:
@@ -390,12 +442,17 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'args': args # Save args for reloading
             }, checkpoint_path)
             print(f"Saved best model checkpoint to {checkpoint_path}")
-            # wandb.save(str(checkpoint_path)) # Saving files to wandb might be slow/large
+        
+        # Update learning rate for batch-based schedulers
+        if scheduler is not None and isinstance(scheduler, torch.optim.lr_scheduler.LambdaLR):
+            for _ in range(len(train_loader)):
+                scheduler.step()
         
         # Visualize predictions and log to wandb (e.g., every 5 epochs)
         if (epoch + 1) % 5 == 0 or epoch == args.num_epochs - 1:
@@ -411,12 +468,12 @@ def main():
             'epoch': args.num_epochs,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
             'train_loss': train_loss, # Last epoch train loss
             'val_loss': val_loss,     # Last epoch val loss
             'args': args
         }, final_checkpoint_path)
         print(f"Saved final model checkpoint to {final_checkpoint_path}")
-        # wandb.save(str(final_checkpoint_path)) 
     
     # Finish wandb run
     wandb.finish()

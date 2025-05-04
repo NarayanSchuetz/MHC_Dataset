@@ -642,7 +642,9 @@ class FilteredMhcDataset(BaseMhcDataset):
                  include_mask: bool = False,
                  feature_indices: Optional[List[int]] = None,
                  feature_stats: Optional[dict] = None,
-                 postprocessors: Optional[List[Callable]] = None):
+                 postprocessors: Optional[List[Callable]] = None,
+                 use_cache: bool = False,
+                 force_recompute: bool = False):
         """
         Args:
             dataframe (pd.DataFrame): The denormalized dataframe containing metadata and labels.
@@ -655,6 +657,8 @@ class FilteredMhcDataset(BaseMhcDataset):
             feature_stats (Optional[dict]): Optional dictionary for feature standardization.
                                             Passed to BaseMhcDataset.
             postprocessors (Optional[List[Callable]]): Postprocessors passed to BaseMhcDataset.
+            use_cache (bool): Whether to use caching for processed samples. Passed to BaseMhcDataset.
+            force_recompute (bool): If True, cached samples will be ignored and recomputed. Passed to BaseMhcDataset.
         """
         # Ensure the label_of_interest has the '_value' suffix for filtering
         label_col = f"{label_of_interest}_value" if not label_of_interest.endswith('_value') else label_of_interest
@@ -685,7 +689,9 @@ class FilteredMhcDataset(BaseMhcDataset):
             include_mask=include_mask,
             feature_indices=feature_indices,
             feature_stats=feature_stats,
-            postprocessors=postprocessors
+            postprocessors=postprocessors,
+            use_cache=use_cache,
+            force_recompute=force_recompute
         )
 
         # Store the label of interest for reference
@@ -709,7 +715,9 @@ class FlattenedMhcDataset(BaseMhcDataset):
                  include_mask: bool = False,
                  feature_indices: Optional[List[int]] = None,
                  feature_stats: Optional[dict] = None,
-                 postprocessors: Optional[List[Callable]] = None):
+                 postprocessors: Optional[List[Callable]] = None,
+                 use_cache: bool = False,
+                 force_recompute: bool = False):
         """
         Initializes the FlattenedMhcDataset. Arguments are passed directly
         to the BaseMhcDataset constructor.
@@ -721,13 +729,17 @@ class FlattenedMhcDataset(BaseMhcDataset):
             feature_indices (Optional[List[int]]): Optional list of feature indices.
             feature_stats (Optional[dict]): Optional dictionary for feature standardization.
             postprocessors (Optional[List[Callable]]): Postprocessors passed to BaseMhcDataset.
+            use_cache (bool): Whether to use caching for processed samples. Passed to BaseMhcDataset.
+            force_recompute (bool): If True, cached samples will be ignored and recomputed. Passed to BaseMhcDataset.
         """
         super().__init__(dataframe=dataframe,
                          root_dir=root_dir,
                          include_mask=include_mask,
                          feature_indices=feature_indices,
                          feature_stats=feature_stats,
-                         postprocessors=postprocessors)
+                         postprocessors=postprocessors,
+                         use_cache=use_cache,
+                         force_recompute=force_recompute)
         logger.info("Initialized FlattenedMhcDataset. Output data/mask shape will be (num_features, num_days * 1440).")
 
     def __getitem__(self, idx):
@@ -803,7 +815,9 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
                  include_mask: bool = False,
                  feature_indices: Optional[List[int]] = None,
                  feature_stats: Optional[dict] = None,
-                 postprocessors: Optional[List[Callable]] = None):
+                 postprocessors: Optional[List[Callable]] = None,
+                 use_cache: bool = False,
+                 force_recompute: bool = False):
         """
         Args:
             dataframe (pd.DataFrame): The denormalized dataframe.
@@ -820,6 +834,8 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
             feature_stats (Optional[dict]): Optional dictionary for feature standardization.
                                             Passed to BaseMhcDataset.
             postprocessors (Optional[List[Callable]]): Postprocessors passed to BaseMhcDataset.
+            use_cache (bool): Whether to use caching for processed samples. Passed to BaseMhcDataset.
+            force_recompute (bool): If True, cached samples will be ignored and recomputed. Passed to BaseMhcDataset.
         """
         # --- Parameter Validation ---
         if not isinstance(sequence_len, int) or sequence_len <= 0:
@@ -863,7 +879,9 @@ class ForecastingEvaluationDataset(BaseMhcDataset):
             include_mask=include_mask,
             feature_indices=feature_indices,
             feature_stats=feature_stats,
-            postprocessors=postprocessors
+            postprocessors=postprocessors,
+            use_cache=use_cache,
+            force_recompute=force_recompute
         )
         logger.info(f"Initialized ForecastingEvaluationDataset with sequence_len={sequence_len}, "
                     f"prediction_horizon={prediction_horizon}, overlap={overlap}.")
@@ -988,7 +1006,9 @@ class FlattenedForecastingDataset(FlattenedMhcDataset):
                  include_mask: bool = False,
                  feature_indices: Optional[List[int]] = None,
                  feature_stats: Optional[dict] = None,
-                 postprocessors: Optional[List[Callable]] = None):
+                 postprocessors: Optional[List[Callable]] = None,
+                 use_cache: bool = False,
+                 force_recompute: bool = False):
         """
         Args:
             dataframe (pd.DataFrame): The denormalized dataframe.
@@ -1005,6 +1025,8 @@ class FlattenedForecastingDataset(FlattenedMhcDataset):
             feature_stats (Optional[dict]): Optional dictionary for feature standardization.
                                             Passed to FlattenedMhcDataset.
             postprocessors (Optional[List[Callable]]): Postprocessors passed to FlattenedMhcDataset.
+            use_cache (bool): Whether to use caching for processed samples. Passed to FlattenedMhcDataset.
+            force_recompute (bool): If True, cached samples will be ignored and recomputed. Passed to FlattenedMhcDataset.
         """
         # --- Parameter Validation ---
         if not isinstance(sequence_len, int) or sequence_len <= 0:
@@ -1040,7 +1062,9 @@ class FlattenedForecastingDataset(FlattenedMhcDataset):
             include_mask=include_mask,
             feature_indices=feature_indices,
             feature_stats=feature_stats,
-            postprocessors=postprocessors
+            postprocessors=postprocessors,
+            use_cache=use_cache,
+            force_recompute=force_recompute
         )
         logger.info(f"Initialized FlattenedForecastingDataset with sequence_len={sequence_len}, "
                     f"prediction_horizon={prediction_horizon}, overlap={overlap}.")

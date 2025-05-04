@@ -41,8 +41,12 @@ python3 scripts/forecasting_lstm_experiment.py \
   --num_workers 16 \
   --dataset_path /scratch/users/schuetzn/data/mhc_dataset_out/splits/train_final_dataset.parquet \
   --val_dataset_path /scratch/users/schuetzn/data/mhc_dataset_out/splits/validation_dataset.parquet \
-  --run_name "forecast_lstm_5d_in_2d_out_h720_$(date +%Y%m%d_%H%M%S)" #\
-  # --use_revin 
-  # --revin_affine
+  --run_name "forecast_lstm_5d_in_2d_out_h520_$(date +%Y%m%d_%H%M%S)" \
+  --use_revin \
+  # --revin_affine \
+  # --l2_weight 0.0001 \
+  # --use_lr_scheduler \
+  # --warmup_epochs 10 \
+  # --lr_cycles 3
 
 echo "Forecasting experiment script finished." 
