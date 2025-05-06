@@ -24,7 +24,6 @@ kiwisolver==1.4.7
 MarkupSafe==3.0.2
 matplotlib==3.9.4
 matplotlib-inline==0.1.7
--e git+https://github.com/NarayanSchuetz/MHC_Dataset.git@dea7eb0f7edbc107fe31dbb98b6964f628b4cb49#egg=mhc_dataset
 mpmath==1.3.0
 nest-asyncio==1.6.0
 networkx==3.2.1
