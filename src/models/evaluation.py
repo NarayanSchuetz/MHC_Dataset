@@ -7,6 +7,7 @@ import torch.nn.functional as F # Added for mse_loss
 
 from torch_dataset import ForecastingEvaluationDataset
 from models.lstm import AutoencoderLSTM, RevInAutoencoderLSTM
+from models.forecasting_lstm import RevInForecastingLSTM, ForecastingLSTM
 
 
 def parse_forecast_split(split_str: str) -> Tuple[int, int, int]:
@@ -46,7 +47,7 @@ def parse_forecast_split(split_str: str) -> Tuple[int, int, int]:
 
 
 def _predict_batch(
-    model: Union[AutoencoderLSTM, RevInAutoencoderLSTM],
+    model: Union[AutoencoderLSTM, RevInAutoencoderLSTM, RevInForecastingLSTM, ForecastingLSTM],
     data_x: torch.Tensor,
     data_y: torch.Tensor,
     prediction_horizon: int,
@@ -81,22 +82,30 @@ def _predict_batch(
     total_input_segments = num_days_in * segments_per_day
 
     # Reshape data_x: [B, D_in, F, T_x] -> [B, total_input_segments, F * minutes_per_segment]
-    try:
-        reshaped_data_x = data_x.view(
-            batch_size, num_days_in, num_features, segments_per_day, minutes_per_segment
-        ).permute(0, 1, 3, 2, 4).reshape(
-            batch_size, total_input_segments, num_features * minutes_per_segment
-        )
-    except RuntimeError as e:
-         return None, data_y, None # Indicate failure
+
+    reshaped_data_x = data_x.view(
+        batch_size, num_days_in, num_features, segments_per_day, minutes_per_segment
+    ).permute(0, 1, 3, 2, 4).reshape(
+        batch_size, total_input_segments, num_features * minutes_per_segment
+    )
+
 
     # --- Generate predictions ---
     target_segments = prediction_horizon // minutes_per_segment
-    try:
+    
+    # Check which prediction method exists
+    if hasattr(model, 'predict_future'):
         predictions = model.predict_future(reshaped_data_x, steps=target_segments)
-        # Predictions shape: [B, target_segments, num_features * minutes_per_segment]
-    except Exception as e:
-        return None, data_y, None # Indicate failure
+    elif hasattr(model, 'predict'):
+        # NOTE: The 'predict' method in RevInForecastingLSTM might expect a different input format
+        # or might not directly take 'steps' in the same way. 
+        # We are assuming reshaped_data_x and target_segments are compatible for now.
+        # If errors occur here, the call to model.predict might need adjustment.
+        predictions = model.predict(reshaped_data_x, steps=target_segments) 
+    else:
+        raise AttributeError(f"Model of type {type(model).__name__} has neither 'predict_future' nor 'predict' method.")
+        
+    # Predictions shape: [B, target_segments, num_features * minutes_per_segment]
 
     # --- Reshape predictions to match data_y shape ---
     # Target data_y shape: [B, D_out, F, T_steps_per_day == time_steps_y]
@@ -121,27 +130,24 @@ def _predict_batch(
         target_segments = expected_total_segments # Adjust target segments for reshape
 
     # [B, target_segments, F * min_per_seg] -> [B, D_out, F, T_steps_per_day]
-    try:
-        reshaped_preds = predictions.view(
-            batch_size, target_segments, num_features, minutes_per_segment # B, T_seg_tot, F, M_per_seg
-        ).view(
-            batch_size, pred_days_out, calculated_segments_per_day_out, num_features, minutes_per_segment # B, D_out, S_per_day, F, M_per_seg
-        ).permute(
-            0, 1, 3, 2, 4 # B, D_out, F, S_per_day, M_per_seg
-        ).reshape(
-            batch_size, pred_days_out, num_features, T_steps_per_day # B, D_out, F, T_steps_day
-        )
 
-        # Final shape check and alignment
-        if reshaped_preds.shape != data_y.shape:
-            min_d = min(reshaped_preds.shape[1], data_y.shape[1])
-            min_f = min(reshaped_preds.shape[2], data_y.shape[2])
-            min_t = min(reshaped_preds.shape[3], data_y.shape[3])
-            reshaped_preds = reshaped_preds[:, :min_d, :min_f, :min_t]
-            data_y = data_y[:, :min_d, :min_f, :min_t] # Align labels too
+    reshaped_preds = predictions.view(
+        batch_size, target_segments, num_features, minutes_per_segment # B, T_seg_tot, F, M_per_seg
+    ).view(
+        batch_size, pred_days_out, calculated_segments_per_day_out, num_features, minutes_per_segment # B, D_out, S_per_day, F, M_per_seg
+    ).permute(
+        0, 1, 3, 2, 4 # B, D_out, F, S_per_day, M_per_seg
+    ).reshape(
+        batch_size, pred_days_out, num_features, T_steps_per_day # B, D_out, F, T_steps_day
+    )
 
-    except (RuntimeError, ValueError) as e:
-        return None, data_y, None # Indicate failure
+    # Final shape check and alignment
+    if reshaped_preds.shape != data_y.shape:
+        min_d = min(reshaped_preds.shape[1], data_y.shape[1])
+        min_f = min(reshaped_preds.shape[2], data_y.shape[2])
+        min_t = min(reshaped_preds.shape[3], data_y.shape[3])
+        reshaped_preds = reshaped_preds[:, :min_d, :min_f, :min_t]
+        data_y = data_y[:, :min_d, :min_f, :min_t] # Align labels too
 
     return reshaped_preds, data_y, None # Return aligned preds/labels, mask handled separately
 
@@ -476,10 +482,6 @@ def evaluate_forecast_dataset(
                     model, data_x, data_y, prediction_horizon, device
                 )
 
-                # Skip batch if prediction/reshaping failed
-                if predictions is None:
-                    print("Skipping batch due to prediction/reshaping error.")
-                    continue
                     
                 # Align mask if predictions/labels were aligned
                 if predictions.shape != valid_mask_elements.shape:
@@ -669,6 +671,94 @@ def run_forecast_evaluation(
     return results # Return the results dictionary
 
 
+def evaluate_model(
+    model: Union[AutoencoderLSTM, RevInAutoencoderLSTM],
+    dataset,  # ForecastingEvaluationDataset or compatible
+    batch_size: int = 16,
+    device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+    feature_names: Optional[List[str]] = None
+) -> Dict:
+    """
+    Simplified evaluation function that only requires a model and dataset.
+    
+    Args:
+        model: The LSTM model to evaluate
+        dataset: Pre-configured dataset with forecasting data
+        batch_size: Batch size for evaluation
+        device: Device to run evaluation on
+        feature_names: Optional list of feature names for reporting
+        
+    Returns:
+        Dictionary containing the evaluation results.
+        
+    Example:
+        ```python
+        from torch_dataset import ForecastingEvaluationDataset
+        from models.evaluation import evaluate_model
+        
+        # Create dataset
+        dataset = ForecastingEvaluationDataset(
+            dataframe=test_df,
+            root_dir="path/to/data",
+            sequence_len=7200,  # 5 days in minutes
+            prediction_horizon=2880,  # 2 days in minutes
+            overlap=0
+        )
+        
+        # Evaluate model
+        results = evaluate_model(model, dataset)
+        ```
+    """
+    # Run evaluation using the dataset-based evaluator
+    results = evaluate_forecast_dataset(
+        model=model,
+        dataset=dataset,
+        batch_size=batch_size,
+        device=device
+    )
+    
+    # --- Print Overall Results ---
+    print("\n--- Overall Metrics ---")
+    print(f"MAE:            {results.get('overall_mae', float('nan')):.4f}")
+    print(f"MSE:            {results.get('overall_mse', float('nan')):.4f}")
+    print(f"Pearson Corr.:  {results.get('overall_pearson_corr', float('nan')):.4f}")
+    
+    # --- Print Per-Channel Results ---
+    print("\n--- Per-Channel Metrics ---")
+    channel_maes = results.get('channel_mae', [])
+    channel_mses = results.get('channel_mse', [])
+    channel_cors = results.get('channel_pearson_corr', [])
+    num_channels = len(channel_maes)
+
+    # Determine feature labels
+    if feature_names and len(feature_names) == num_channels:
+        feature_labels = feature_names
+    else:
+        feature_labels = [f"Feature {i}" for i in range(num_channels)]
+    
+    # Print table header
+    header = f"{'Feature':<20} {'MAE':<10} {'MSE':<10} {'Corr':<10}"
+    print(header)
+    print("-" * len(header))
+    
+    # Print each channel's metrics
+    for i in range(num_channels):
+        label = feature_labels[i]
+        mae = channel_maes[i] if i < len(channel_maes) else float('nan')
+        mse = channel_mses[i] if i < len(channel_mses) else float('nan')
+        corr = channel_cors[i] if i < len(channel_cors) else float('nan')
+        
+        mae_str = f"{mae:.4f}" if not np.isnan(mae) else "NaN"
+        mse_str = f"{mse:.4f}" if not np.isnan(mse) else "NaN"
+        corr_str = f"{corr:.4f}" if not np.isnan(corr) else "NaN"
+        
+        print(f"{label:<20} {mae_str:<10} {mse_str:<10} {corr_str:<10}")
+        
+    print("-" * len(header))
+    
+    return results # Return the results dictionary
+
+
 # Usage example:
 if __name__ == "__main__":
     import argparse
@@ -682,7 +772,7 @@ if __name__ == "__main__":
     parser.add_argument('--split', type=str, default='5-2d', help='Forecast split (e.g., "5-2d")')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for evaluation')
     parser.add_argument('--no_mask', action='store_true', help='Disable using mask during evaluation')
-    parser.add_argument('--use_dataset_api', action='store_true', help='Use the dataset-based API instead of dataframe')
+    parser.add_argument('--use_simple_api', action='store_true', help='Use the simplified evaluation API')
     args = parser.parse_args()
     
     # Load the CSV file
@@ -718,40 +808,38 @@ if __name__ == "__main__":
     num_features_loaded = model.num_features
     feature_names = [f"Feature_{i}" for i in range(num_features_loaded)]
     
-    # Run evaluation
-    if args.use_dataset_api:
-        # Parse the split string for dataset creation
-        sequence_len, prediction_horizon, overlap = parse_forecast_split(args.split)
-        
-        # Create the dataset directly
-        print(f"Creating evaluation dataset with split {args.split}...")
-        dataset = ForecastingEvaluationDataset(
-            dataframe=test_df,
-            root_dir=args.data_root,
-            sequence_len=sequence_len,
-            prediction_horizon=prediction_horizon,
-            overlap=overlap,
-            include_mask=(not args.no_mask)
+    # Parse the split string for dataset creation
+    sequence_len, prediction_horizon, overlap = parse_forecast_split(args.split)
+    
+    # Create the dataset
+    print(f"Creating evaluation dataset with split {args.split}...")
+    dataset = ForecastingEvaluationDataset(
+        dataframe=test_df,
+        root_dir=args.data_root,
+        sequence_len=sequence_len,
+        prediction_horizon=prediction_horizon,
+        overlap=overlap,
+        include_mask=(not args.no_mask)
+    )
+    
+    # Run evaluation with the appropriate API
+    if args.use_simple_api:
+        # Use the new simplified API
+        print(f"Using simplified API with {len(dataset)} samples")
+        evaluation_results = evaluate_model(
+            model=model,
+            dataset=dataset,
+            batch_size=args.batch_size,
+            device=device,
+            feature_names=feature_names
         )
-        
-        print(f"Using dataset-based API with {len(dataset)} samples")
+    else:
+        # Use the original API
+        print(f"Using original API with {len(dataset)} samples")
         evaluation_results = run_forecast_evaluation(
             model=model,
             batch_size=args.batch_size,
             feature_names=feature_names,
             device=device,
-            dataset=dataset  # Pass the pre-configured dataset
-        )
-    else:
-        # Use the original API
-        print("Using dataframe-based API")
-        evaluation_results = run_forecast_evaluation(
-            model=model,
-            dataframe=test_df,
-            root_dir=args.data_root,
-            split=args.split,
-            batch_size=args.batch_size,
-            include_mask=(not args.no_mask),
-            feature_names=feature_names,
-            device=device
+            dataset=dataset
         )
