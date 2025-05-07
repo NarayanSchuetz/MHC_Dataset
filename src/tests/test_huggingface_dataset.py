@@ -13,7 +13,7 @@ import time # Import time
 # Adjust import path based on your project structure
 # Assumes tests are run from the root directory
 from src.torch_dataset import FlattenedMhcDataset
-from src.huggingface_dataset import mhc_timeseries_generator, create_and_save_hf_dataset
+from src.huggingface_dataset import mhc_timeseries_generator, create_and_save_hf_dataset_as_gluonTS_style
 
 # Configure logging for tests (optional, can help debugging)
 logging.basicConfig(level=logging.DEBUG)
@@ -171,7 +171,7 @@ def hf_save_path(tmp_path):
 
 def test_create_and_save_basic(flattened_mhc_dataset, hf_save_path):
     """Test basic dataset creation and saving."""
-    create_and_save_hf_dataset(
+    create_and_save_hf_dataset_as_gluonTS_style(
         torch_dataset=flattened_mhc_dataset,
         save_path=hf_save_path,
         num_features=NUM_SELECTED_FEATURES,
@@ -204,7 +204,7 @@ def test_create_and_save_basic(flattened_mhc_dataset, hf_save_path):
 
 def test_create_and_save_with_mask(flattened_mhc_dataset, hf_save_path):
     """Test saving with the mask included."""
-    create_and_save_hf_dataset(
+    create_and_save_hf_dataset_as_gluonTS_style(
         torch_dataset=flattened_mhc_dataset,
         save_path=hf_save_path,
         num_features=NUM_SELECTED_FEATURES,
@@ -221,7 +221,7 @@ def test_create_and_save_with_mask(flattened_mhc_dataset, hf_save_path):
 
 def test_reload_saved_dataset(flattened_mhc_dataset, hf_save_path):
     """Test reloading the saved dataset and verifying schema and content."""
-    create_and_save_hf_dataset(
+    create_and_save_hf_dataset_as_gluonTS_style(
         torch_dataset=flattened_mhc_dataset,
         save_path=hf_save_path,
         num_features=NUM_SELECTED_FEATURES,
@@ -251,7 +251,7 @@ def test_reload_saved_dataset(flattened_mhc_dataset, hf_save_path):
 
 def test_num_features_inference(flattened_mhc_dataset, hf_save_path):
     """Test if num_features is inferred correctly when not provided."""
-    create_and_save_hf_dataset(
+    create_and_save_hf_dataset_as_gluonTS_style(
         torch_dataset=flattened_mhc_dataset,
         save_path=hf_save_path,
         num_features=None, # Let the function infer
@@ -263,7 +263,7 @@ def test_num_features_inference(flattened_mhc_dataset, hf_save_path):
 def test_create_and_save_with_options(flattened_mhc_dataset, hf_save_path, tmp_path):
     """Test passing optional arguments like cache_dir, num_proc, keep_in_memory."""
     cache_dir = tmp_path / "hf_cache"
-    create_and_save_hf_dataset(
+    create_and_save_hf_dataset_as_gluonTS_style(
         torch_dataset=flattened_mhc_dataset,
         save_path=hf_save_path,
         num_features=NUM_SELECTED_FEATURES,

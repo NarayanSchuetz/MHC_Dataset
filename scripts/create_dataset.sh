@@ -157,9 +157,10 @@ if [ $? -ne 0 ]; then
 fi
 
 # Move the resulting files to their final locations
-mv "$SPLIT_OUTPUT_DIR/temp/train_dataset.parquet" "$SPLIT_OUTPUT_DIR/train_final_dataset.parquet"
 mv "$SPLIT_OUTPUT_DIR/temp/test_dataset.parquet" "$SPLIT_OUTPUT_DIR/validation_dataset.parquet"
-mv "$SPLIT_OUTPUT_DIR/train_dataset.parquet" "$SPLIT_OUTPUT_DIR/train_with_val_dataset.parquet"
+mv "$SPLIT_OUTPUT_DIR/temp/train_dataset.parquet" "$SPLIT_OUTPUT_DIR/train_dataset.parquet"
+# The original "$SPLIT_OUTPUT_DIR/train_dataset.parquet" (which was train+val combined) has now been overwritten by the final train set.
+# The "$SPLIT_OUTPUT_DIR/test_dataset.parquet" (final test set from Step 3) remains untouched and correctly named.
 rm -rf "$SPLIT_OUTPUT_DIR/temp"
 
 # Check if the script ran successfully
@@ -178,8 +179,7 @@ if [ $? -eq 0 ]; then
   echo "Files:"
   echo "- test_dataset.parquet: Test set (${test_pct}% of data)"
   echo "- validation_dataset.parquet: Validation set (${val_pct}% of data)"
-  echo "- train_final_dataset.parquet: Final train set (${train_pct}% of data)"
-  echo "- train_with_val_dataset.parquet: Combined train+val set (kept for reference)"
+  echo "- train_dataset.parquet: Train set (${train_pct}% of data)"
 else
   echo "Error: Data splitting failed."
   exit 1
