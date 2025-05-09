@@ -224,37 +224,33 @@ class BaseMhcDataset(Dataset):
         Raises:
             FileNotFoundError: If the file does not exist.
             ValueError: If the array dimensions or shapes are incorrect.
-            IOError: If there's an error loading or processing the file.
+            IOError: If there's an error loading or processing the file (e.g. from np.load).
         """
         if not file_path.is_file():
              raise FileNotFoundError(f"File not found during load attempt: {file_path}")
 
-        try:
-            data_array = np.load(file_path).astype(np.float32)
+        # np.load can raise IOError, ValueError, PickleError etc. These will propagate.
+        data_array = np.load(file_path).astype(np.float32)
 
-            # Perform the slicing: index 1 for data, index 0 for mask
-            if data_array.ndim < 3:
-                 raise ValueError(f"Expected >=3 dimensions in {file_path}, but got shape {data_array.shape}")
-            if data_array.shape[0] < 2:
-                 raise ValueError(f"Expected >=2 elements in first dimension (mask+data) in {file_path}, but got shape {data_array.shape}")
+        # Perform the slicing: index 1 for data, index 0 for mask
+        if data_array.ndim < 3:
+             raise ValueError(f"Expected >=3 dimensions in {file_path}, but got shape {data_array.shape}")
+        if data_array.shape[0] < 2:
+             raise ValueError(f"Expected >=2 elements in first dimension (mask+data) in {file_path}, but got shape {data_array.shape}")
 
-            data_slice = data_array[1, :, :] # Data is always at index 1
+        data_slice = data_array[1, :, :] # Data is always at index 1
 
-            # Validate raw data shape before selection
-            if data_slice.shape != expected_raw_shape:
-                raise ValueError(f"Expected raw data shape {expected_raw_shape} after slicing {file_path}, but got {data_slice.shape}")
+        # Validate raw data shape before selection
+        if data_slice.shape != expected_raw_shape:
+            raise ValueError(f"Expected raw data shape {expected_raw_shape} after slicing {file_path}, but got {data_slice.shape}")
 
-            if include_mask:
-                mask_slice = data_array[0, :, :] # Mask is at index 0
-                if mask_slice.shape != expected_raw_shape:
-                    raise ValueError(f"Expected raw mask shape {expected_raw_shape} after slicing {file_path}, but got {mask_slice.shape}")
-                return mask_slice, data_slice
-            else:
-                return data_slice
-
-        except Exception as e:
-            logger.error(f"Could not load or process file {file_path}. Error: {e}")
-            raise IOError(f"Failed to load or process data from {file_path}") from e
+        if include_mask:
+            mask_slice = data_array[0, :, :] # Mask is at index 0
+            if mask_slice.shape != expected_raw_shape:
+                raise ValueError(f"Expected raw mask shape {expected_raw_shape} after slicing {file_path}, but got {mask_slice.shape}")
+            return mask_slice, data_slice
+        else:
+            return data_slice
 
     @staticmethod
     def _generate_date_range(start_date_str: str, end_date_str: str) -> List[str]:
@@ -477,7 +473,7 @@ class BaseMhcDataset(Dataset):
                              daily_data.append(data_ph)
                          else:
                              daily_data.append(placeholder)
-                except (ValueError, IOError, Exception) as e:
+                except (ValueError, IOError) as e: # Catch specific, handled errors (e.g. from _load_and_slice_npy or np.load)
                      logger.error(f"Failed loading/slicing raw file {file_path} for sample {idx}, date {date_str}. Using placeholder. Error: {e}")
                      if self.include_mask:
                          mask_ph, data_ph = placeholder
@@ -562,13 +558,8 @@ class BaseMhcDataset(Dataset):
         # 7. Apply postprocessors sequentially
         for processor in self.postprocessors:
              if callable(processor):
-                 try:
-                     # Processor should take the sample dict and return the modified dict
-                     result_dict = processor(result_dict)
-                 except Exception as e:
-                     logger.error(f"Error applying postprocessor {type(processor).__name__} to sample {idx}: {e}", exc_info=True)
-                     # Reraise to make the problem visible during development/debugging
-                     raise RuntimeError(f"Postprocessor {type(processor).__name__} failed for sample {idx}") from e
+                 logger.debug(f"Applying postprocessor: {processor.__class__.__name__}")
+                 result_dict = processor(result_dict)
              else:
                  logger.warning(f"Item in postprocessors list is not callable: {type(processor)}. Skipping.")
 

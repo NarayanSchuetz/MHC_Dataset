@@ -223,6 +223,126 @@ def visualize_npy_directory(
         )
 
 
+def visualize_data_mask_arrays(
+    data: np.ndarray,
+    mask: np.ndarray,
+    output_path: Optional[str] = None,
+    show_plot: bool = True,
+    figsize: Tuple[int, int] = (15, 20),
+    dpi: int = 100,
+    feature_subset: Optional[List[int]] = None,
+    title: Optional[str] = "Data Visualization",
+    feature_labels: List[str] = FEATURE_LABELS 
+) -> None:
+    """
+    Visualizes data and mask NumPy arrays as individual time series plots.
+    
+    Parameters:
+    -----------
+    data : np.ndarray
+        The data array to visualize (features x time).
+    mask : np.ndarray
+        The mask array corresponding to the data (features x time).
+    output_path : Optional[str]
+        Path to save the visualization. If None, the plot is not saved.
+    show_plot : bool
+        Whether to display the plot.
+    figsize : Tuple[int, int]
+        Figure size in inches (width, height).
+    dpi : int
+        Resolution of the figure.
+    feature_subset : Optional[List[int]]
+        Indices of features to visualize. If None, all features are visualized.
+    title : Optional[str]
+        Title for the plot.
+    feature_labels : List[str]
+        Labels for the features. Defaults to FEATURE_LABELS.
+    
+    Returns:
+    --------
+    None
+    """
+    # Apply feature subset filter if provided
+    if feature_subset is not None:
+        data_to_plot = data[feature_subset]
+        mask_to_plot = mask[feature_subset]
+        current_labels = [feature_labels[i] for i in feature_subset]
+    else:
+        data_to_plot = data
+        mask_to_plot = mask
+        # Use only as many labels as we have features in the provided data
+        current_labels = feature_labels[:data_to_plot.shape[0]] 
+    
+    # Create time array (minutes)
+    time = np.arange(data_to_plot.shape[1])
+    
+    # Create figure with subplots
+    n_features = len(current_labels)
+    if n_features == 0:
+        print("No features to plot.")
+        return
+        
+    fig, axes = plt.subplots(n_features, 1, figsize=figsize, dpi=dpi, sharex=True)
+    if n_features == 1:
+        axes = [axes]  # Ensure axes is always a list
+    
+    # Add more space on the left for labels
+    plt.subplots_adjust(left=0.2)
+    
+    # Plot each feature
+    for i, (ax, label) in enumerate(zip(axes, current_labels)):
+        # Special handling for heart rate
+        if "HeartRate" in label:
+            # Plot heart rate as markers only
+            ax.plot(time, data_to_plot[i], 'o', markersize=2, label='Data')
+        else:
+            # Plot other features as lines
+            ax.plot(time, data_to_plot[i], label='Data')
+        
+        # Plot the mask if it's not all ones
+        if not np.all(mask_to_plot[i] == 1):
+            ax.plot(time, mask_to_plot[i], label='Mask', alpha=0.5)
+        
+        # Keep y-ticks but hide the feature label as y-axis label
+        ax.set_ylabel('')  # Clear default axis label
+        
+        # Add feature label as text on the left
+        ax.text(-0.22, 0.5, label, va='center', ha='left', transform=ax.transAxes)
+        
+        # Add legend if mask is plotted
+        if not np.all(mask_to_plot[i] == 1):
+            ax.legend(loc='upper right')
+        
+        # Add grid
+        ax.grid(True, alpha=0.3)
+    
+    # Set x-axis label and ticks for the last subplot
+    axes[-1].set_xlabel('Time (minutes)')
+    
+    # Convert minutes to hours for x-axis ticks
+    hours = np.arange(0, 24, 2)
+    hour_ticks = np.array(hours) * 60
+    axes[-1].set_xticks(hour_ticks)
+    axes[-1].set_xticklabels([f"{h:02d}:00" for h in hours])
+    
+    # Add title
+    fig.suptitle(title, y=1.02)
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save if output path is provided
+    if output_path:
+        plt.savefig(output_path, bbox_inches='tight')
+        print(f"Visualization saved to {output_path}")
+    
+    # Show if requested
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
 if __name__ == "__main__":
     # Example usage
     # visualize_npy_file("/path/to/data/2022-01-01.npy")
@@ -238,5 +358,26 @@ if __name__ == "__main__":
     visualize_npy_file(
         "/var/folders/s5/9tx92s6n1r1g20vf5q0j7gxc0000gp/T/tmpd9r8xy0n/2017-08-04.npy",
         output_path="/Users/narayanschuetz/tmp_data/verify_data/2017-08-04_visualization.png",
+        show_plot=True
+    )
+
+    # Example usage for visualize_data_mask_arrays
+    # Generate dummy data and mask
+    num_features = 5
+    num_timepoints = 1440  # 24 hours * 60 minutes
+    dummy_data = np.random.rand(num_features, num_timepoints)
+    dummy_mask = np.ones((num_features, num_timepoints))
+    # Make some parts of the mask zero for demonstration
+    dummy_mask[0, 100:200] = 0  # Mask out feature 0 for some time
+    dummy_mask[2, 500:600] = 0  # Mask out feature 2 for some time
+    
+    # Select a subset of default feature labels for the dummy data
+    dummy_feature_labels = FEATURE_LABELS[:num_features]
+
+    visualize_data_mask_arrays(
+        data=dummy_data,
+        mask=dummy_mask,
+        feature_labels=dummy_feature_labels,
+        title="Dummy Data Visualization from Arrays",
         show_plot=True
     )
